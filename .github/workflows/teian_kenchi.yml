@@ -1,0 +1,61 @@
+name: 提案機会検知くん
+
+on:
+  # スケジュール実行は cron-job.org (https://console.cron-job.org/) から
+  # workflow_dispatch API でトリガーする。GitHub Actions の内蔵 schedule は
+  # 遅延が大きいため使わない。
+  # 想定起動：平日 JST 11:00 / 13:00 / 15:00 / 17:00 / 19:00
+  workflow_dispatch:
+    inputs:
+      custom_after:
+        description: "検索開始（JST、例: 2026-06-05 11:00）。空なら通常ロジック"
+        required: false
+        default: ""
+      custom_before:
+        description: "検索終了（JST、例: 2026-06-05 13:00）。空なら通常ロジック"
+        required: false
+        default: ""
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: teian-kenchi
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run detection
+        id: detect
+        env:
+          CLAUDE_REFRESH_TOKEN: ${{ secrets.CLAUDE_REFRESH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_USER_TOKEN: ${{ secrets.SLACK_USER_TOKEN }}
+          GOOGLE_SHEETS_KEY: ${{ secrets.GOOGLE_SHEETS_KEY }}
+          CUSTOM_AFTER: ${{ github.event.inputs.custom_after }}
+          CUSTOM_BEFORE: ${{ github.event.inputs.custom_before }}
+        run: python scripts/run_teian_kenchi.py
+
+      - name: Rotate CLAUDE_REFRESH_TOKEN
+        # 検知本体が失敗してもローテ済トークンが取れていれば書き戻す（次回の保険）
+        if: always() && steps.detect.outputs.new_refresh_token != ''
+        env:
+          GH_TOKEN: ${{ secrets.PAT_FOR_SECRETS }}
+          NEW_TOKEN: ${{ steps.detect.outputs.new_refresh_token }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::PAT_FOR_SECRETS 未設定のためトークン書き戻しをスキップ"
+            exit 0
+          fi
+          printf '%s' "$NEW_TOKEN" | gh secret set CLAUDE_REFRESH_TOKEN --repo "${{ github.repository }}"
+          echo "✅ CLAUDE_REFRESH_TOKEN を書き戻しました"
