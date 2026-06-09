@@ -144,6 +144,11 @@ def run_teian_kenchi() -> None:
 
         for mtg in meetings:
             mtype = classify_meeting_type(mtg.call_name, mtg.meeting_title, mtg.tasks_customer, mtg.memo)
+            # 社内MTGは完全スキップ（通知もスプシも対象外）
+            # 提案機会検知くんは社外MTGからのアップセル機会検知が主目的
+            if mtype == "社内":
+                print(f"[skip] 社内MTG: {mtg.call_name}", flush=True)
+                continue
             project = extract_project_name(mtg.channel_name, mtg.call_name)
             clean_title = strip_prefix_from_call_name(mtg.call_name)
             meeting_key = f"{mtg.channel_id}_{int(mtg.posted_at.timestamp())}"
