@@ -1,10 +1,11 @@
 """
-提案機会検知くん コア実装
+提案機会検知くん コア実装（2026-06-09 改訂版・議事録単位フォーマット）
 
 設計方針:
 - 議事録転送Bot (U0B305165M1) の投稿だけをスキャン
-- 議事録を構造化パース → 各項目（▼決定事項/▼タスク/▼メモ）を AI 判定（分類タグ・サマリ生成）
-- 1議事録項目 = 1スプシ行 = 1Slack通知メッセージ
+- 議事録を構造化パース → 各項目を AI 判定（絵文字🆕/🚨/🏃 or 空 + サマリ）
+- **1議事録 = 1親メッセージ + 1スレッド子メッセージ**（▼メモあれば）
+- **1議事録項目 = 1スプシ行**（▼メモ採用分も1行）
 - 初版: メンションなし通知（マネ＋AMメンションは別フェーズ）
 - 初版: 期日リマインダーは別フェーズ
 """
@@ -35,6 +36,24 @@ EXTRACT_END_MARKER = "関係構築・心理的距離:"
 
 EVALUATE_BATCH_SIZE = 8
 
+# 絵文字優先順位（複数該当時は左から選ぶ）
+EMOJI_PRIORITY = ["🆕", "🚨", "🏃"]
+
+# セクション見出し
+SECTION_LABEL_FOR_NOTIFY = {
+    "decision": "▼決定事項",
+    "task_customer": "▼タスク<顧客>",
+    "task_nyle": "▼タスク<ナイル>",
+    "memo": "▼その他留意事項",
+}
+
+SECTION_LABEL_FOR_SHEET = {
+    "decision": "決定事項",
+    "task_customer": "タスク<顧客>",
+    "task_nyle": "タスク<ナイル>",
+    "memo": "メモ",
+}
+
 
 @dataclass
 class MinutesMeeting:
@@ -53,35 +72,32 @@ class MinutesMeeting:
 
 @dataclass
 class DetectedItem:
-    """検知された1項目（=スプシ1行 = Slack通知1メッセージ）"""
+    """検知された1項目（=スプシ1行）。Slack通知は議事録単位で集約される"""
     meeting_posted_at: datetime
     meeting_type: str            # 社外/社内
     channel_name: str
     channel_id: str
-    project_name: str            # 案件名
+    project_name: str
     meeting_title: str
-    tags: list[str]              # ['🟡','🔵']
+    emoji: str                   # 🆕 / 🚨 / 🏃 / "" のいずれか
     summary: str
     due_date: str                # YYYY-MM-DD or ""
     due_raw: str                 # 議事録上の原文
     minutes_url: str             # 議事録Bot投稿permalink
     source_section: str          # 'decision' | 'task_customer' | 'task_nyle' | 'memo'
     original_text: str
-    notification_url: str = ""   # 通知投稿後に埋める
+    notification_url: str = ""   # 親メッセージ投稿後に埋める
+    meeting_key: str = ""        # 議事録単位の集約キー（channel_id + posted_at）
 
 
 # ========== メイン ==========
 
 def run_teian_kenchi() -> None:
     """提案機会検知くん 本体"""
-    # 営業時間外スキップ（GitHub Actions schedule 由来のみ。workflow_dispatch は対象外）
     event = os.environ.get("GITHUB_EVENT_NAME", "")
     now_jst = datetime.now(JST)
     if event == "schedule" and (now_jst.hour < 10 or now_jst.hour >= 21):
-        print(
-            f"[skip] 営業時間外 ({now_jst.strftime('%H:%M')} JST) のためスキップ",
-            flush=True,
-        )
+        print(f"[skip] 営業時間外 ({now_jst.strftime('%H:%M')} JST)", flush=True)
         return
 
     claude = ClaudeClient()
@@ -107,12 +123,20 @@ def run_teian_kenchi() -> None:
                 meetings.append(m)
         print(f"[parse] {len(meetings)} meetings parsed", flush=True)
 
+        if not meetings:
+            print("[end] 議事録0件、終了", flush=True)
+            return
+
         # Phase 4: 社外/社内振り分け & 項目展開
         items: list[DetectedItem] = []
+        meeting_lookup: dict[str, MinutesMeeting] = {}
         for mtg in meetings:
             mtype = classify_meeting_type(mtg.call_name, mtg.meeting_title, mtg.tasks_customer, mtg.memo)
             project = extract_project_name(mtg.channel_name, mtg.call_name)
             clean_title = strip_prefix_from_call_name(mtg.call_name)
+            meeting_key = f"{mtg.channel_id}_{int(mtg.posted_at.timestamp())}"
+            meeting_lookup[meeting_key] = mtg
+
             for section_name, lines in [
                 ("decision", mtg.decisions),
                 ("task_customer", mtg.tasks_customer),
@@ -128,17 +152,18 @@ def run_teian_kenchi() -> None:
                         channel_id=mtg.channel_id,
                         project_name=project,
                         meeting_title=clean_title,
-                        tags=[],
+                        emoji="",
                         summary="",
                         due_date=due_date,
                         due_raw=due_raw,
                         minutes_url=mtg.permalink,
                         source_section=section_name,
                         original_text=line,
+                        meeting_key=meeting_key,
                     ))
         print(f"[expand] {len(items)} items expanded", flush=True)
 
-        # Phase 5: AI判定（タグ・サマリ生成）
+        # Phase 5: AI判定（絵文字・サマリ生成・ノイズ除外）
         items = evaluate_with_claude(claude, items, skill_content)
         print(f"[evaluate] {len(items)} items after AI filter", flush=True)
 
@@ -146,24 +171,60 @@ def run_teian_kenchi() -> None:
             print("[notify] 検知0件のため通知スキップ", flush=True)
             return
 
-        # Phase 6: 通知 (メンションなし版) ＆ スプシ書き込み
-        rows_to_append = []
-        for item in items:
-            text = build_notification_text(item)
-            resp = slack.post_message(NOTIFICATION_CHANNEL, text)
-            if resp.get("ok"):
-                # 通知permalink取得
-                item.notification_url = slack_get_permalink(
-                    slack, NOTIFICATION_CHANNEL, resp.get("ts", "")
-                )
-            rows_to_append.append(build_sheet_row(item))
+        # Phase 6: 議事録ごとにグループ化 → 通知＆スプシ追記
+        grouped: dict[str, list[DetectedItem]] = {}
+        for it in items:
+            grouped.setdefault(it.meeting_key, []).append(it)
 
-        appended = sheets.append_rows(rows_to_append)
-        print(f"[sheets] appended {appended} rows", flush=True)
-        print(f"[notify] posted {len(items)} messages", flush=True)
+        rows_to_append: list[dict] = []
+        for meeting_key, group_items in grouped.items():
+            mtg = meeting_lookup.get(meeting_key)
+            if not mtg:
+                continue
+
+            # 親メッセージ投稿
+            parent_text = build_parent_message(mtg, group_items)
+            parent_resp = slack.post_message(NOTIFICATION_CHANNEL, parent_text)
+            parent_ts = parent_resp.get("ts", "") if parent_resp.get("ok") else ""
+            parent_permalink = (
+                slack_get_permalink(slack, NOTIFICATION_CHANNEL, parent_ts)
+                if parent_ts else ""
+            )
+
+            # スレッド子メッセージ投稿（▼メモ採用分があれば）
+            memo_items = [i for i in group_items if i.source_section == "memo"]
+            if memo_items and parent_ts:
+                thread_text = build_thread_message(memo_items)
+                _post_thread(slack, NOTIFICATION_CHANNEL, parent_ts, thread_text)
+
+            # 全項目の notification_url に親メッセージpermalink を入れる
+            for it in group_items:
+                it.notification_url = parent_permalink
+                rows_to_append.append(build_sheet_row(it))
+
+            print(f"[notify] meeting={meeting_key} items={len(group_items)} posted", flush=True)
+
+        # スプシに一括書き込み
+        if rows_to_append:
+            appended = sheets.append_rows(rows_to_append)
+            print(f"[sheets] appended {appended} rows", flush=True)
     finally:
         if claude.has_token_rotated():
             _emit_refresh_token_output(claude.get_current_refresh_token())
+
+
+def _post_thread(slack: SlackTools, channel: str, thread_ts: str, text: str) -> None:
+    """親メッセージのスレッドに子メッセージを投稿"""
+    try:
+        slack.client.chat_postMessage(
+            channel=channel,
+            text=text,
+            thread_ts=thread_ts,
+            unfurl_links=False,
+            unfurl_media=False,
+        )
+    except Exception as e:
+        print(f"[thread post error] {e}", flush=True)
 
 
 def _emit_refresh_token_output(token: str) -> None:
@@ -188,13 +249,12 @@ def determine_search_range(slack: SlackTools) -> tuple[int, int]:
         return af, bf
 
     now_ts = int(datetime.now(JST).timestamp())
-    # 通知チャンネルから直近の自Bot通知投稿を探す
     messages = slack.read_channel_recent(NOTIFICATION_CHANNEL, limit=50)
     last_post_ts = None
     for msg in messages:
         text = msg.get("text", "")
-        # 提案機会検知くんの通知フォーマットマーカー
-        if "📌" in text and "🔗 議事録:" in text:
+        # 提案機会検知くんの新フォーマットマーカー
+        if "📌 下記MTGから提案機会を検知しました" in text:
             try:
                 last_post_ts = int(float(msg.get("ts", "0")))
                 break
@@ -212,11 +272,6 @@ def determine_search_range(slack: SlackTools) -> tuple[int, int]:
 # ========== Phase 2: スキャン ==========
 
 def scan_minutes_bot_posts(slack: SlackTools, after_ts: int, before_ts: int) -> list[dict]:
-    """議事録Bot (U0B305165M1) の投稿を範囲指定で取得"""
-    # Slack検索クエリ: from:<@U0B305165M1>
-    # ただし slack_tools.search は内部で -is:bot を付加してしまうため、
-    # bot投稿を拾うには search を介さず直接 search_messages を叩く必要がある
-    # → ここは SlackTools の制約に合わせて include_bots を考慮した検索を呼ぶ
     return _search_bot_messages(slack, MINUTES_BOT_USER_ID, after_ts, before_ts, limit=50)
 
 
@@ -244,9 +299,7 @@ def _search_bot_messages(slack: SlackTools, bot_user_id: str, after_ts: int, bef
 # ========== Phase 3: 議事録パース ==========
 
 def parse_minutes_post(post: dict) -> MinutesMeeting | None:
-    """議事録Bot投稿1件を MinutesMeeting に変換"""
     text = post.get("text", "")
-
     body = extract_target_range(text)
     if not body:
         return None
@@ -284,7 +337,6 @@ def parse_minutes_post(post: dict) -> MinutesMeeting | None:
 
 
 def extract_target_range(text: str) -> str:
-    """「要約:」から「関係構築・心理的距離:」直前まで"""
     start = text.find(EXTRACT_START_MARKER)
     if start == -1:
         return ""
@@ -295,7 +347,6 @@ def extract_target_range(text: str) -> str:
 
 
 def extract_call_name(text: str) -> str:
-    """「コール名:」の値、なければ1行目"""
     m = re.search(r"コール名[:：]\s*(.+)", text)
     if m:
         return m.group(1).strip()
@@ -304,15 +355,11 @@ def extract_call_name(text: str) -> str:
 
 
 def extract_meeting_title(body: str) -> str:
-    """<会議議題> の本文"""
     m = re.search(r"<会議議題>\s*\n(.+?)(?=\n▼|\n<|\Z)", body, re.DOTALL)
-    if m:
-        return m.group(1).strip()
-    return ""
+    return m.group(1).strip() if m else ""
 
 
 def extract_section_lines(body: str, section_marker: str) -> list[str]:
-    """▼決定事項 / ▼メモ などの箇条書きを抽出"""
     pattern = re.escape(section_marker) + r"\s*\n(.+?)(?=\n▼|\Z)"
     m = re.search(pattern, body, re.DOTALL)
     if not m:
@@ -321,14 +368,12 @@ def extract_section_lines(body: str, section_marker: str) -> list[str]:
 
 
 def extract_section_block(body: str, section_marker: str) -> str:
-    """セクション本体全体を取り出す（▼タスク 全体など）"""
     pattern = re.escape(section_marker) + r"\s*\n(.+?)(?=\n▼|\Z)"
     m = re.search(pattern, body, re.DOTALL)
     return m.group(1) if m else ""
 
 
 def extract_subsection_lines(block: str, sub_marker: str) -> list[str]:
-    """<顧客> / <ナイル> サブセクションの箇条書き"""
     pattern = re.escape(sub_marker) + r"\s*\n(.+?)(?=\n<|\Z)"
     m = re.search(pattern, block, re.DOTALL)
     if not m:
@@ -337,7 +382,6 @@ def extract_subsection_lines(block: str, sub_marker: str) -> list[str]:
 
 
 def _extract_bullet_lines(text: str) -> list[str]:
-    """・ で始まる箇条書き（全角/半角スペースインデント可）"""
     lines = []
     for raw in text.split("\n"):
         stripped = raw.strip().lstrip("　 ")
@@ -351,30 +395,26 @@ def _extract_bullet_lines(text: str) -> list[str]:
 # ========== Phase 4: 社外/社内振り分け & 案件名抽出 ==========
 
 def classify_meeting_type(call_name: str, title: str, tasks_customer: list[str], memo: list[str]) -> str:
-    """社外/社内 判定（3段階）"""
     if any(x in call_name for x in ["【社外】", "社外_", "【外部】"]):
         return "社外"
     if any(x in call_name for x in ["【社内】", "社内_", "【内部】"]):
         return "社内"
     if "【確定】" in call_name:
         return "社外"
-    if tasks_customer:  # 顧客タスクがあれば社外寄り
+    if tasks_customer:
         return "社外"
     return "社内"
 
 
 def extract_project_name(channel_name: str, call_name: str) -> str:
-    """案件名抽出。チャンネル名 #社内_<案件名>_<案件コード> から、または コール名から"""
     m = re.match(r"社内_(.+?)(?:_[\d\-]+)?$", channel_name)
     if m:
-        # 末尾の _<数字> パターンを除去
         name = re.sub(r"_[\d\-]+$", "", m.group(1))
         return name
     return strip_prefix_from_call_name(call_name)
 
 
 def strip_prefix_from_call_name(call_name: str) -> str:
-    """コール名から【社外】等のプレフィクスを除去"""
     cleaned = call_name
     for prefix in ["【社外】", "【社内】", "【確定】", "【外部】", "【内部】", "社外_", "社内_"]:
         if cleaned.startswith(prefix):
@@ -385,19 +425,14 @@ def strip_prefix_from_call_name(call_name: str) -> str:
 # ========== 期日抽出 ==========
 
 DUE_DATE_REGEX = re.compile(r"(20\d{2})/(\d{1,2})/(\d{1,2})")
-
-# 期日表記とおぼしき括弧
 DUE_BRACKET_REGEX = re.compile(
     r"[（(]([^（）()]*?(?:期日|〆|まで|までに|予定|末|上旬|中旬|下旬|早急|随時|進行中|未定|指定なし|完了時|受領後|以内|想定|XX|月中|/中)[^（）()]*?)[）)]"
 )
 
 
 def extract_due_date(text: str) -> tuple[str, str]:
-    """期日抽出。A型なら (YYYY-MM-DD, 原文)、B型なら ("", 原文)"""
     bracket_match = DUE_BRACKET_REGEX.search(text)
     if not bracket_match:
-        # 期日らしい括弧がない場合
-        # → 単純な YYYY/MM/DD があれば A型として拾う
         dates = DUE_DATE_REGEX.findall(text)
         if dates:
             latest = max(dates, key=lambda d: (int(d[0]), int(d[1]), int(d[2])))
@@ -425,7 +460,7 @@ def extract_due_date(text: str) -> tuple[str, str]:
 # ========== Phase 5: AI判定 ==========
 
 def evaluate_with_claude(claude: ClaudeClient, items: list[DetectedItem], skill_content: str) -> list[DetectedItem]:
-    """各項目に分類タグ・サマリをAI判定。ノイズはフィルタする"""
+    """各項目に絵文字・サマリをAI判定。ノイズはフィルタする"""
     if not items:
         return []
 
@@ -453,30 +488,38 @@ def evaluate_with_claude(claude: ClaudeClient, items: list[DetectedItem], skill_
         if i not in all_results:
             continue
         r = all_results[i]
-        item.tags = r.get("tags", []) or []
+        item.emoji = _normalize_emoji(r.get("emoji", ""))
         item.summary = r.get("summary", "") or ""
-        if item.tags:  # タグなしは出さない
+        # サマリが空のものはスキップ（AI判定不全）
+        if item.summary:
             filtered.append(item)
     return filtered
+
+
+def _normalize_emoji(emoji: str) -> str:
+    """AI出力の絵文字を正規化（不正値は空文字に）"""
+    if emoji in EMOJI_PRIORITY:
+        return emoji
+    return ""
 
 
 def _evaluate_batch(claude: ClaudeClient, batch: list[tuple[int, DetectedItem]], skill_content: str) -> list[dict]:
     """1バッチをClaude APIに投げる"""
     user_payload = {
-        "task": "以下の議事録項目を skill の分類タグ判定ルールに従って判定し、各項目に tags と summary を付与した JSON配列を返してください（前後にテキストを付けない）。",
+        "task": "以下の議事録項目を skill の絵文字判定ルールに従って判定し、各項目に emoji（🆕/🚨/🏃/空文字のいずれか1つ）と summary（40字程度1行）を付与した JSON配列を返してください（前後にテキストを付けない）。",
         "output_schema": [
             {
                 "item_id": "integer（入力の item_id をそのまま返す）",
-                "tags": "list[string] - 🟢/🟡/🔵/⚪/🔥 の組み合わせ",
+                "emoji": "string - 🆕/🚨/🏃/空文字 のいずれか1つ",
                 "summary": "string - 40字程度の1行サマリ",
                 "is_noise": "boolean - 出力配列から除外したい場合 true",
             }
         ],
         "rules": [
-            "▼タスク<ナイル> (source_section='task_nyle') の項目は必ず 🔵 を付与",
-            "▼タスク<顧客> (source_section='task_customer') の項目は必ず ⚪ を付与",
-            "▼決定事項 (source_section='decision') / ▼メモ (source_section='memo') でシグナル語彙を含むものに 🟢 または 🟡 を付与",
-            "シグナル語彙に該当しない情報共有のみの項目（▼メモ等）は is_noise=true",
+            "絵文字判定: 🆕(アップセル機会+予算系) > 🚨(競争・リスク+顧客課題) > 🏃(早急) の優先順位で1項目1絵文字",
+            "シグナル語彙に該当しない通常項目は emoji='' (空文字)",
+            "▼決定事項 (source_section='decision') / ▼タスク (source_section='task_customer' or 'task_nyle') は原則すべて出力（特になし等のみ is_noise=true）",
+            "▼メモ (source_section='memo') は『マネ＋AMが判断に使える情報』のみ出力。雑談・進捗確認・社内共有のみは is_noise=true",
             "結果は JSON 配列のみ。コードブロック・前置きなし",
         ],
         "items": [
@@ -519,40 +562,63 @@ def _evaluate_batch(claude: ClaudeClient, batch: list[tuple[int, DetectedItem]],
 
 # ========== Phase 6: 通知整形 ==========
 
-def build_notification_text(item: DetectedItem) -> str:
-    """スリム版5行通知（メンションなし版・初版）"""
-    tags_str = "".join(item.tags) if item.tags else "⚪"
-    if item.meeting_title:
-        project_title = f"{item.project_name} ／ {item.meeting_title}"
-    else:
-        project_title = item.project_name
+def build_parent_message(meeting: MinutesMeeting, items: list[DetectedItem]) -> str:
+    """親メッセージ：議事録1件分のヘッダ＋▼決定事項/▼タスク<顧客>/▼タスク<ナイル>セクション"""
+    project_name = extract_project_name(meeting.channel_name, meeting.call_name)
+    clean_title = strip_prefix_from_call_name(meeting.call_name)
+    title_line = f"{project_name} ／ {clean_title}" if clean_title else project_name
 
-    # 期日表示
+    lines = [
+        "📌 下記MTGから提案機会を検知しました！",
+        "",
+        f"*{title_line}*",
+        f"議事録：{meeting.permalink}",
+    ]
+
+    # ▼メモ以外のセクションを順番に並べる
+    sections_order = ["decision", "task_customer", "task_nyle"]
+    for section in sections_order:
+        section_items = [i for i in items if i.source_section == section]
+        if not section_items:
+            continue
+        lines.append("")
+        lines.append(f"*{SECTION_LABEL_FOR_NOTIFY[section]}*")
+        for it in section_items:
+            head = f"{it.emoji} " if it.emoji else " "
+            lines.append(f"{head}{it.summary}")
+            lines.append(f"【期日】{_format_due_for_notify(it)}")
+            lines.append("")
+        # 末尾の空行を1つ詰める
+        if lines and lines[-1] == "":
+            lines.pop()
+
+    return "\n".join(lines)
+
+
+def build_thread_message(memo_items: list[DetectedItem]) -> str:
+    """スレッド子メッセージ：▼その他留意事項（=▼メモから採用された項目）"""
+    lines = ["*▼その他留意事項*"]
+    for it in memo_items:
+        head = f"{it.emoji} " if it.emoji else " "
+        lines.append(f"{head}{it.summary}")
+    return "\n".join(lines)
+
+
+def _format_due_for_notify(item: DetectedItem) -> str:
+    """通知用の期日表記"""
     if item.due_date:
         try:
             dt = datetime.strptime(item.due_date, "%Y-%m-%d")
             wd = JP_WEEKDAYS[dt.weekday()]
-            due_display = f"{dt.strftime('%Y/%m/%d')}（{wd}）"
+            return f"{dt.strftime('%Y/%m/%d')}（{wd}）"
         except ValueError:
-            due_display = item.due_date
-    elif item.due_raw:
-        due_display = item.due_raw
-    else:
-        due_display = "期日なし"
-
-    lines = [
-        f"{tags_str} *{project_title}*",
-        "",
-        f"📌 {item.summary}",
-        f"📅 {due_display}",
-        "",
-        f"🔗 議事録: {item.minutes_url}",
-    ]
-    return "\n".join(lines)
+            return item.due_date
+    if item.due_raw:
+        return item.due_raw
+    return "期日なし"
 
 
 def slack_get_permalink(slack: SlackTools, channel_id: str, ts: str) -> str:
-    """Slack chat.getPermalink API で投稿のpermalinkを取得"""
     if not ts:
         return ""
     try:
@@ -566,18 +632,24 @@ def slack_get_permalink(slack: SlackTools, channel_id: str, ts: str) -> str:
 # ========== スプシ行構築 ==========
 
 def build_sheet_row(item: DetectedItem) -> dict:
-    """スプシ14列の dict を構築（teian_sheets_tools.COLUMNS と整合）"""
+    """スプシ14列の dict を構築（F列「分類タグ」= 絵文字＋セクション名）"""
+    section_label = SECTION_LABEL_FOR_SHEET.get(item.source_section, item.source_section)
+    if item.emoji:
+        category_tag = f"{item.emoji} {section_label}"
+    else:
+        category_tag = section_label
+
     return {
         "議事録投稿日時": item.meeting_posted_at.strftime("%Y/%m/%d %H:%M"),
         "社外/社内": item.meeting_type,
         "チャンネル名": item.channel_name,
         "案件名": item.project_name,
         "会議タイトル": item.meeting_title,
-        "分類タグ": "".join(item.tags),
+        "分類タグ": category_tag,
         "サマリ": item.summary,
         "期日（確定）": item.due_date,
         "期日（原文）": item.due_raw,
-        "担当": "",  # 初版はメンション機能なし。別フェーズで supervisor_map から初期値投入
+        "担当": "",  # 初版空欄、PR2 で supervisor_map 流用予定
         "ステータス": "",
         "議事録URL": item.minutes_url,
         "通知URL": item.notification_url,
