@@ -282,7 +282,9 @@ def determine_search_range(slack: SlackTools) -> tuple[int, int]:
     last_post_ts = None
     for msg in messages:
         text = msg.get("text", "")
-        if "📌 下記MTGから提案機会を検知しました" in text:
+        # 通知メッセージ側は「📌」絵文字あり、ただしSlack API レスポンスで
+        # 絵文字が ":pushpin:" 表記になる場合があるため、検索は絵文字抜きで照合する
+        if "下記MTGから提案機会を検知しました" in text:
             try:
                 last_post_ts = int(float(msg.get("ts", "0")))
                 break
@@ -292,7 +294,8 @@ def determine_search_range(slack: SlackTools) -> tuple[int, int]:
     if last_post_ts:
         return last_post_ts, now_ts
 
-    start = datetime.now(JST) - timedelta(hours=2)
+    # フォールバック: 直近24時間（前回通知時刻が拾えなかった場合の取りこぼし防止）
+    start = datetime.now(JST) - timedelta(hours=24)
     return int(start.timestamp()), now_ts
 
 
@@ -677,7 +680,8 @@ def build_parent_message(meeting: MinutesMeeting, items: list[DetectedItem]) -> 
         lines.append("")
         lines.append(f"*{SECTION_LABEL_FOR_NOTIFY[section]}*")
         for it in section_items:
-            head = f"{it.emoji} " if it.emoji else " "
+            # 絵文字あれば絵文字、なければ「・」で箇条書きを揃える
+            head = f"{it.emoji} " if it.emoji else "・"
             lines.append(f"{head}{it.summary}")
             # ▼BANT は期日表記なし（4項目セットの説明文形式のため）
             if section != "bant":
@@ -694,7 +698,7 @@ def build_thread_message(memo_items: list[DetectedItem]) -> str:
     memo_items = _sort_by_emoji_priority(memo_items)
     lines = ["*▼その他留意事項*"]
     for it in memo_items:
-        head = f"{it.emoji} " if it.emoji else " "
+        head = f"{it.emoji} " if it.emoji else "・"
         lines.append(f"{head}{it.summary}")
     return "\n".join(lines)
 
