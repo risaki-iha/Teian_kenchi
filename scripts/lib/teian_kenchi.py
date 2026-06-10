@@ -710,18 +710,31 @@ def build_parent_message(meeting: MinutesMeeting, items: list[DetectedItem]) -> 
 def build_thread_message(thread_items: list[DetectedItem]) -> str:
     """スレッド子メッセージ：▼参考情報。
     - 装飾なし項目（emoji="") と ▼メモ採用分 を統合
-    - 元議事録のセクション情報をプレフィクスとして付与（[決定事項] [タスク<ナイル>] 等）
+    - 元議事録のセクションでグルーピングして表示（[決定事項] / [タスク<顧客>] / [タスク<ナイル>] / [BANT] / [メモ]）
     """
     if not thread_items:
         return ""
-    lines = ["*▼参考情報*"]
+
+    # source_section でグルーピング
+    grouped: dict[str, list[DetectedItem]] = {}
     for it in thread_items:
-        section_prefix = SECTION_LABEL_FOR_SHEET.get(it.source_section, "")
-        head = f"{it.emoji} " if it.emoji else "・"
-        if section_prefix:
-            lines.append(f"{head}[{section_prefix}] {it.summary}")
-        else:
+        section_label = SECTION_LABEL_FOR_SHEET.get(it.source_section, "")
+        grouped.setdefault(section_label, []).append(it)
+
+    # 表示順
+    section_order = ["決定事項", "タスク<顧客>", "タスク<ナイル>", "BANT", "メモ"]
+
+    lines = ["*▼参考情報*"]
+    for section in section_order:
+        items = grouped.get(section, [])
+        if not items:
+            continue
+        lines.append("")
+        lines.append(f"[{section}]")
+        for it in items:
+            head = f"{it.emoji} " if it.emoji else "・"
             lines.append(f"{head}{it.summary}")
+
     return "\n".join(lines)
 
 
