@@ -56,9 +56,9 @@ SECTION_LABEL_FOR_SHEET = {
 # 親メッセージは「絵文字軸」3セクション構成（マネ＋AM視点で攻める/守る/やる）
 # 装飾なし項目とメモはスレッド子メッセージ「▼参考情報」へ
 EMOJI_PARENT_SECTIONS = [
-    ("🆕", "🆕 アップセル機会"),
-    ("🚨", "🚨 リスク警告"),
-    ("🏃", "🏃 タスク（TODO）"),
+    ("🆕", "▼アップセル機会"),
+    ("🚨", "▼リスク警告"),
+    ("🏃", "▼タスク（TODO）"),
 ]
 
 # amptalk議事録の冒頭にある :link: amptalk: <URL> 行を除去する正規表現
@@ -500,7 +500,12 @@ def extract_project_name(channel_name: str, call_name: str) -> str:
 
 def strip_prefix_from_call_name(call_name: str) -> str:
     cleaned = call_name
-    for prefix in ["【社外】", "【社内】", "【確定】", "【外部】", "【内部】", "【Zoom】", "社外_", "社内_"]:
+    # 通常の議事録Bot投稿のコール名プレフィクス + amptalk議事録の <会議議題>/<議題> ラベル
+    for prefix in [
+        "【社外】", "【社内】", "【確定】", "【外部】", "【内部】", "【Zoom】",
+        "社外_", "社内_",
+        "<会議議題>", "<議題>",
+    ]:
         if cleaned.startswith(prefix):
             cleaned = cleaned[len(prefix):]
     return cleaned.strip()
@@ -673,14 +678,16 @@ def build_parent_message(meeting: MinutesMeeting, items: list[DetectedItem]) -> 
     """
     project_name = extract_project_name(meeting.channel_name, meeting.call_name)
     clean_title = strip_prefix_from_call_name(meeting.call_name)
-    title_line = f"{project_name} ／ {clean_title}" if clean_title else project_name
 
     lines = [
         "📌 下記MTGから提案機会を検知しました！",
         "",
-        f"*{title_line}*",
-        f"議事録：{meeting.permalink}",
+        f"*{project_name}*",
     ]
+    # 会議タイトルが案件名と異なる場合のみ2行目に出す（重複表示防止）
+    if clean_title and clean_title != project_name:
+        lines.append(f"*{clean_title}*")
+    lines.append(f"議事録：{meeting.permalink}")
 
     # 絵文字軸で再分類（元のセクション横断、絵文字付き項目だけ親メッセージへ）
     for emoji, label in EMOJI_PARENT_SECTIONS:
