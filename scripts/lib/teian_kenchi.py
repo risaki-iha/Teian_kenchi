@@ -13,6 +13,7 @@
 - 初版: 期日リマインダーは別フェーズ
 """
 
+import html
 import json
 import os
 import re
@@ -328,7 +329,10 @@ def _search_bot_messages(slack: SlackTools, bot_user_id: str, after_ts: int, bef
 # ========== Phase 3: 議事録パース ==========
 
 def parse_minutes_post(post: dict) -> MinutesMeeting | None:
-    text = post.get("text", "")
+    # Slack search.messages API は本文を HTMLエスケープして返すため、ここで復元する
+    # （&lt;顧客&gt; → <顧客>、&amp; → & 等。extract_subsection_lines や
+    #  extract_meeting_title が <顧客>/<ナイル>/<会議議題> を正しくマッチするために必要）
+    text = html.unescape(post.get("text", ""))
 
     # 抽出範囲を柔軟に決定（「要約:」など開始マーカーがあればそこから、なければ全体）
     body = extract_target_range_flex(text)
