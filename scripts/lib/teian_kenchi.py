@@ -45,14 +45,6 @@ EVALUATE_BATCH_SIZE = 8
 EMOJI_PRIORITY = ["🆕", "🚨", "🏃"]
 
 # セクション見出し
-SECTION_LABEL_FOR_NOTIFY = {
-    "decision": "▼決定事項",
-    "task_customer": "▼タスク<顧客>",
-    "task_nyle": "▼タスク<ナイル>",
-    "bant": "▼BANT",
-    "memo": "▼その他留意事項",
-}
-
 SECTION_LABEL_FOR_SHEET = {
     "decision": "決定事項",
     "task_customer": "タスク<顧客>",
@@ -61,8 +53,16 @@ SECTION_LABEL_FOR_SHEET = {
     "memo": "メモ",
 }
 
-# 親メッセージで表示するセクションの順序
-PARENT_SECTIONS_ORDER = ["decision", "task_customer", "task_nyle", "bant"]
+# 親メッセージは「絵文字軸」3セクション構成（マネ＋AM視点で攻める/守る/やる）
+# 装飾なし項目とメモはスレッド子メッセージ「▼参考情報」へ
+EMOJI_PARENT_SECTIONS = [
+    ("🆕", "🆕 アップセル機会"),
+    ("🚨", "🚨 リスク警告"),
+    ("🏃", "🏃 タスク（TODO）"),
+]
+
+# amptalk議事録の冒頭にある :link: amptalk: <URL> 行を除去する正規表現
+AMPTALK_LINK_PATTERN = re.compile(r"^:link:\s*amptalk:\s*<[^>]+>\s*\n?", re.MULTILINE)
 
 
 @dataclass
@@ -213,10 +213,11 @@ def run_teian_kenchi() -> None:
                 if parent_ts else ""
             )
 
-            # スレッド子メッセージ投稿（▼メモ採用分があれば）
-            memo_items = [i for i in group_items if i.source_section == "memo"]
-            if memo_items and parent_ts:
-                thread_text = build_thread_message(memo_items)
+            # スレッド子メッセージ投稿
+            # 親メッセージから漏れた項目（装飾なし全部 + memoの装飾なし）を「▼参考情報」として展開
+            thread_items = [i for i in group_items if i.emoji == ""]
+            if thread_items and parent_ts:
+                thread_text = build_thread_message(thread_items)
                 _post_thread(slack, NOTIFICATION_CHANNEL, parent_ts, thread_text)
 
             # 全項目の notification_url に親メッセージpermalink を入れる
@@ -333,6 +334,9 @@ def parse_minutes_post(post: dict) -> MinutesMeeting | None:
     # （&lt;顧客&gt; → <顧客>、&amp; → & 等。extract_subsection_lines や
     #  extract_meeting_title が <顧客>/<ナイル>/<会議議題> を正しくマッチするために必要）
     text = html.unescape(post.get("text", ""))
+
+    # amptalk議事録の冒頭にある「:link: amptalk: <URL>」行は通知に不要なので除去
+    text = AMPTALK_LINK_PATTERN.sub("", text).strip()
 
     # 抽出範囲を柔軟に決定（「要約:」など開始マーカーがあればそこから、なければ全体）
     body = extract_target_range_flex(text)
@@ -662,7 +666,11 @@ def _sort_by_emoji_priority(items: list[DetectedItem]) -> list[DetectedItem]:
 
 
 def build_parent_message(meeting: MinutesMeeting, items: list[DetectedItem]) -> str:
-    """親メッセージ：議事録1件分のヘッダ＋セクション。各セクション内は絵文字優先順位順に並べ替え"""
+    """親メッセージ：議事録1件分のヘッダ＋絵文字軸3セクション。
+    - 🆕 アップセル機会 / 🚨 リスク警告 / 🏃 タスク（TODO）
+    - 元議事録のセクション（▼決定事項/▼タスク/▼BANT等）を横断して、絵文字で再分類
+    - 装飾なし項目と ▼メモ採用分は親には載せず、スレッド子に回す
+    """
     project_name = extract_project_name(meeting.channel_name, meeting.call_name)
     clean_title = strip_prefix_from_call_name(meeting.call_name)
     title_line = f"{project_name} ／ {clean_title}" if clean_title else project_name
@@ -674,22 +682,17 @@ def build_parent_message(meeting: MinutesMeeting, items: list[DetectedItem]) -> 
         f"議事録：{meeting.permalink}",
     ]
 
-    for section in PARENT_SECTIONS_ORDER:
-        section_items = [i for i in items if i.source_section == section]
+    # 絵文字軸で再分類（元のセクション横断、絵文字付き項目だけ親メッセージへ）
+    for emoji, label in EMOJI_PARENT_SECTIONS:
+        section_items = [i for i in items if i.emoji == emoji]
         if not section_items:
             continue
-        # 絵文字優先順位順に並べ替え
-        section_items = _sort_by_emoji_priority(section_items)
 
         lines.append("")
-        lines.append(f"*{SECTION_LABEL_FOR_NOTIFY[section]}*")
+        lines.append(f"*{label}*")
         for it in section_items:
-            # 絵文字あれば絵文字、なければ「・」で箇条書きを揃える
-            head = f"{it.emoji} " if it.emoji else "・"
-            lines.append(f"{head}{it.summary}")
-            # ▼BANT は期日表記なし（4項目セットの説明文形式のため）
-            if section != "bant":
-                lines.append(f"【期日】{_format_due_for_notify(it)}")
+            lines.append(f"{it.emoji} {it.summary}")
+            lines.append(f"【期日】{_format_due_for_notify(it)}")
             lines.append("")
         if lines and lines[-1] == "":
             lines.pop()
@@ -697,13 +700,21 @@ def build_parent_message(meeting: MinutesMeeting, items: list[DetectedItem]) -> 
     return "\n".join(lines)
 
 
-def build_thread_message(memo_items: list[DetectedItem]) -> str:
-    """スレッド子メッセージ：▼その他留意事項。絵文字優先順位順に並べ替え"""
-    memo_items = _sort_by_emoji_priority(memo_items)
-    lines = ["*▼その他留意事項*"]
-    for it in memo_items:
+def build_thread_message(thread_items: list[DetectedItem]) -> str:
+    """スレッド子メッセージ：▼参考情報。
+    - 装飾なし項目（emoji="") と ▼メモ採用分 を統合
+    - 元議事録のセクション情報をプレフィクスとして付与（[決定事項] [タスク<ナイル>] 等）
+    """
+    if not thread_items:
+        return ""
+    lines = ["*▼参考情報*"]
+    for it in thread_items:
+        section_prefix = SECTION_LABEL_FOR_SHEET.get(it.source_section, "")
         head = f"{it.emoji} " if it.emoji else "・"
-        lines.append(f"{head}{it.summary}")
+        if section_prefix:
+            lines.append(f"{head}[{section_prefix}] {it.summary}")
+        else:
+            lines.append(f"{head}{it.summary}")
     return "\n".join(lines)
 
 
