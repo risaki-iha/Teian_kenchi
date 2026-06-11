@@ -135,6 +135,7 @@ def run_teian_kenchi() -> None:
         print(f"[parse] {len(meetings)} meetings parsed", flush=True)
 
         if not meetings:
+            _post_heartbeat(slack, after_ts, before_ts)
             print("[end] 議事録0件、終了", flush=True)
             return
 
@@ -190,7 +191,8 @@ def run_teian_kenchi() -> None:
         print(f"[evaluate] {len(items)} items after AI filter", flush=True)
 
         if not items:
-            print("[notify] 検知0件のため通知スキップ", flush=True)
+            _post_heartbeat(slack, after_ts, before_ts)
+            print("[notify] 検知0件のため通知スキップ（ハートビートのみ投稿）", flush=True)
             return
 
         # Phase 6: 議事録ごとにグループ化 → 通知＆スプシ追記
@@ -244,6 +246,16 @@ def _build_meeting_context(mtg: MinutesMeeting) -> str:
         decisions_excerpt = " / ".join(mtg.decisions[:2])
         lines.append(f"▼決定事項冒頭: {decisions_excerpt}")
     return " | ".join(lines)
+
+
+def _post_heartbeat(slack: SlackTools, after_ts: int, before_ts: int) -> None:
+    """検知0件でも稼働確認のため「💤 検知なし」をハートビート投稿する（将来オフ化予定）"""
+    text = f"💤 検知なし\n対象範囲: {fmt_ts(after_ts)} 〜 {fmt_ts(before_ts)}"
+    try:
+        slack.post_message(NOTIFICATION_CHANNEL, text)
+        print("[heartbeat] 検知0件のハートビート投稿", flush=True)
+    except Exception as e:
+        print(f"[heartbeat error] {e}", flush=True)
 
 
 def _post_thread(slack: SlackTools, channel: str, thread_ts: str, text: str) -> None:
