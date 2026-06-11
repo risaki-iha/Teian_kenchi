@@ -694,12 +694,16 @@ def build_parent_message(meeting: MinutesMeeting, items: list[DetectedItem]) -> 
     lines = [
         "📌 下記MTGから提案機会を検知しました！",
         "",
-        f"*{project_name}*",
+        f"💼 *{project_name}*",
     ]
     # 会議タイトルが案件名と異なる場合のみ2行目に出す（重複表示防止）
     if clean_title and clean_title != project_name:
         lines.append(f"*{clean_title}*")
+    # 会議タイトル/案件名 と 議事録URL の間に1行空ける
+    lines.append("")
     lines.append(f"議事録：{meeting.permalink}")
+    # 議事録URL の下に区切り線
+    lines.append("─" * 20)
 
     # 絵文字軸で再分類（元のセクション横断、絵文字付き項目だけ親メッセージへ）
     for emoji, label in EMOJI_PARENT_SECTIONS:
