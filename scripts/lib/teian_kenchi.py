@@ -91,6 +91,7 @@ class DetectedItem:
     project_name: str
     meeting_title: str
     emoji: str                   # 🆕 / 🚨 / 🏃 / "" のいずれか
+    label: str                   # テーマ見出し（8〜12字、【】記号なし）
     summary: str
     due_date: str                # YYYY-MM-DD or ""
     due_raw: str                 # 議事録上の原文
@@ -176,6 +177,7 @@ def run_teian_kenchi() -> None:
                         project_name=project,
                         meeting_title=clean_title,
                         emoji="",
+                        label="",
                         summary="",
                         due_date=due_date,
                         due_raw=due_raw,
@@ -594,6 +596,7 @@ def evaluate_with_claude(
             continue
         r = all_results[i]
         item.emoji = _normalize_emoji(r.get("emoji", ""))
+        item.label = (r.get("label", "") or "").strip()
         item.summary = r.get("summary", "") or ""
         if item.summary:
             filtered.append(item)
@@ -613,23 +616,26 @@ def _evaluate_batch(
     meeting_context_map: dict[str, str],
 ) -> list[dict]:
     user_payload = {
-        "task": "以下の議事録項目を skill の絵文字判定ルール・採用基準・サマリ生成ガイドに従って判定し、各項目に emoji（🆕/🚨/🏃/空文字のいずれか1つ）と summary（60字程度の自然な日本語サマリ、何の話か文脈含めて具体的に）を付与した JSON配列を返してください（前後にテキストを付けない）。",
+        "task": "以下の議事録項目を skill の絵文字判定ルール・採用基準・ラベル/サマリ生成ガイドに従って判定し、各項目に emoji（🆕/🚨/🏃/空文字のいずれか1つ）、label（8〜12字の体言止めテーマ見出し、【】記号なし）、summary（自然な日本語の簡潔なサマリ、〜50字目安）を付与した JSON配列を返してください（前後にテキストを付けない）。",
         "output_schema": [
             {
                 "item_id": "integer（入力の item_id をそのまま返す）",
                 "emoji": "string - 🆕/🚨/🏃/空文字 のいずれか1つ",
-                "summary": "string - 60字程度の自然な日本語サマリ",
+                "label": "string - 8〜12字の体言止めテーマ見出し（【】記号なし）。装飾なし項目にも付与",
+                "summary": "string - 自然な日本語の簡潔なサマリ（〜50字目安）",
                 "is_noise": "boolean - 出力配列から除外したい場合 true",
             }
         ],
         "rules": [
-            "絵文字判定: 🆕(アップセル機会・攻める価値ある予算系) > 🚨(競争リスク・顧客課題) > 🏃(早急) の優先順位で1項目1絵文字",
+            "絵文字判定: 🆕(アップセル機会・攻める価値ある予算系) > 🚨(競争・離反リスク) > 🏃(早急) の優先順位で1項目1絵文字",
             "🆕 は『攻める価値ある時だけ』付与（予算情報あっても金額小さい・高額難なら装飾なし）",
+            "🚨 は『競争リスク(コンペ/競合/再提案/体制見直し等=取られる)』と『離反・成果リスク(流入減/順位下落/成果不振/解約示唆/強い不満=失う)』だけ。WBS不足・接点頻度・進行透明性などの通常のデリバリー不満は🚨にせず装飾なし",
             "シグナル語彙に該当しない通常項目は emoji='' (空文字)",
             "▼決定事項・▼タスク(顧客/ナイル)・▼BANT は『情報があれば原則すべて採用』。『未確認』『特になし』のみ除外（is_noise=true）",
             "▼メモは『マネ＋AMが判断に使える情報』のみ採用、雑談・進捗・社内共有のみは is_noise=true",
-            "サマリは 60字程度（40〜70字許容）の自然な日本語。『何を』『誰が』『いつまでに』が分かる具体的な文章にする。会議タイトル・他項目の文脈（meeting_context）も参照して何の話か明示する",
-            "抽象動詞（対応・検討・確認）は避け、具体的な目的語を含める",
+            "label は全項目に付与。8〜12字の体言止めで『何の機会/リスク/タスクか』を端的に。【】記号は付けない",
+            "サマリは自然な日本語で簡潔に（〜50字目安、厳格な上限ではない）。『何を』『誰が』が分かる具体的な文章。会議タイトル・他項目の文脈（meeting_context）も参照。期日表記は含めない（別途【期日】行で表示）",
+            "抽象動詞（対応・検討・確認）は避け、具体的な目的語を含める。だらだら重複させず、無理な短縮・不自然な略語も禁止",
             "結果は JSON 配列のみ。コードブロック・前置きなし",
         ],
         "items": [
@@ -682,6 +688,12 @@ def _sort_by_emoji_priority(items: list[DetectedItem]) -> list[DetectedItem]:
     return sorted(items, key=sort_key)
 
 
+def _format_item_line(it: DetectedItem) -> str:
+    """親メッセージの1項目行：`絵文字【ラベル】サマリ`（絵文字とラベルの間にスペースなし）"""
+    label = f"【{it.label}】" if it.label else ""
+    return f"{it.emoji}{label}{it.summary}"
+
+
 def build_parent_message(meeting: MinutesMeeting, items: list[DetectedItem]) -> str:
     """親メッセージ：議事録1件分のヘッダ＋絵文字軸3セクション。
     - 🆕 アップセル機会 / 🚨 リスク警告 / 🏃 タスク（TODO）
@@ -712,8 +724,10 @@ def build_parent_message(meeting: MinutesMeeting, items: list[DetectedItem]) -> 
         lines.append("")
         lines.append(f"*{label}*")
         for it in section_items:
-            lines.append(f"{it.emoji} {it.summary}")
-            lines.append(f"【期日】{_format_due_for_notify(it)}")
+            lines.append(_format_item_line(it))
+            due = _format_due_for_notify(it)
+            if due:
+                lines.append(f"【期日】{due}")
             lines.append("")
         if lines and lines[-1] == "":
             lines.pop()
@@ -747,7 +761,8 @@ def build_thread_message(thread_items: list[DetectedItem]) -> str:
         lines.append(f"[{section}]")
         for it in items:
             head = f"{it.emoji} " if it.emoji else "・"
-            lines.append(f"{head}{it.summary}")
+            label = f"【{it.label}】" if it.label else ""
+            lines.append(f"{head}{label}{it.summary}")
 
     return "\n".join(lines)
 
@@ -762,7 +777,7 @@ def _format_due_for_notify(item: DetectedItem) -> str:
             return item.due_date
     if item.due_raw:
         return item.due_raw
-    return "期日なし"
+    return ""
 
 
 def slack_get_permalink(slack: SlackTools, channel_id: str, ts: str) -> str:
@@ -792,7 +807,7 @@ def build_sheet_row(item: DetectedItem) -> dict:
         "案件名": item.project_name,
         "会議タイトル": item.meeting_title,
         "分類タグ": category_tag,
-        "サマリ": item.summary,
+        "サマリ": f"【{item.label}】{item.summary}" if item.label else item.summary,
         "期日（確定）": item.due_date,
         "期日（原文）": item.due_raw,
         "担当": "",
