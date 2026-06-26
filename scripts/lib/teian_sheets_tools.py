@@ -59,3 +59,15 @@ class TeianSheetsTools:
         values = [[row.get(col, "") for col in COLUMNS] for row in rows]
         self.sheet.append_rows(values, value_input_option="USER_ENTERED")
         return len(values)
+
+    def existing_minutes_urls(self) -> list[str]:
+        """L列「議事録URL」の全値を返す（重複排除用）。
+
+        v2では L列に amptalk コールURL（?id=<call_id>）が入るため、
+        呼び出し側で call_id を抽出して既処理判定に使う。
+        """
+        try:
+            return self.sheet.col_values(12)  # L列（1-indexed）
+        except Exception as e:  # noqa: BLE001
+            print(f"[sheets] L列読み取り失敗（重複排除スキップ）: {e}", flush=True)
+            return []

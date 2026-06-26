@@ -24,8 +24,19 @@ from pathlib import Path
 from .claude_oauth import ClaudeClient
 from .slack_tools import SlackTools
 from .teian_sheets_tools import TeianSheetsTools
+from .amptalk_client import (
+    fetch_calls,
+    fetch_analysis,
+    is_external_title,
+    extract_call_id,
+    call_detail_url,
+)
 
 JST = timezone(timedelta(hours=9))
+
+# amptalk コール取得の遡り窓（時間）。毎回この窓を再走査し、重複排除で冪等にする。
+# 解析未完了のコールを次回以降に拾い直すため、ポーリング間隔より十分広く取る。
+LOOKBACK_HOURS = int(os.environ.get("AMPTALK_LOOKBACK_HOURS", "30"))
 JP_WEEKDAYS = "月火水木金土日"
 
 # 議事録転送Bot
@@ -79,6 +90,10 @@ class MinutesMeeting:
     tasks_nyle: list[str] = field(default_factory=list)
     bant: list[str] = field(default_factory=list)
     memo: list[str] = field(default_factory=list)
+    # v2（amptalk文字起こし駆動）で追加
+    call_id: str = ""        # amptalk call_id（UUID）。重複排除キー＆議事録URLの素
+    proposal: str = ""       # amptalk ネイティブ「提案機会検知」minute（AI判定の文脈）
+    customer: str = ""       # amptalk /calls の customer フィールド（案件名候補）
 
 
 @dataclass
@@ -105,7 +120,12 @@ class DetectedItem:
 # ========== メイン ==========
 
 def run_teian_kenchi() -> None:
-    """提案機会検知くん 本体"""
+    """提案機会検知くん v2（amptalk文字起こし駆動）本体
+
+    旧版は議事録転送Botの投稿をSlackからスキャンしてBot要約を検知材料にしていた。
+    v2は amptalk API を直駆動し、コールの「文字起こし＋構造化要約(要約minute)＋
+    ネイティブ提案機会検知minute」を材料に検知する。Slack投稿には依存しない。
+    """
     event = os.environ.get("GITHUB_EVENT_NAME", "")
     now_jst = datetime.now(JST)
     if event == "schedule" and (now_jst.hour < 10 or now_jst.hour >= 21):
@@ -119,50 +139,58 @@ def run_teian_kenchi() -> None:
         skill_path = Path(__file__).parent.parent.parent / "skills" / "teian-kenchi-realtime.md"
         skill_content = skill_path.read_text(encoding="utf-8")
 
-        # Phase 1: 検索範囲決定
-        after_ts, before_ts = determine_search_range(slack)
-        print(f"[range] {fmt_ts(after_ts)} 〜 {fmt_ts(before_ts)}", flush=True)
+        # Phase 1: 取得窓（callDatetime）を決定
+        after_dt, before_dt = determine_call_window()
+        print(f"[range] {after_dt:%Y/%m/%d %H:%M} 〜 {before_dt:%Y/%m/%d %H:%M} JST", flush=True)
 
-        # Phase 2: 議事録Bot投稿スキャン
-        posts = scan_minutes_bot_posts(slack, after_ts, before_ts)
-        print(f"[scan] {len(posts)} minutes posts", flush=True)
+        # Phase 2: amptalk からコール取得 → 社外フィルタ（title プレフィクス）
+        calls = fetch_calls(after_dt, before_dt)
+        external = [c for c in calls if is_external_title(c.get("title", ""))]
+        print(f"[scan] {len(calls)} calls / {len(external)} external", flush=True)
 
-        # Phase 3: 議事録パース
-        meetings: list[MinutesMeeting] = []
-        for p in posts:
-            m = parse_minutes_post(p)
-            if m:
-                meetings.append(m)
-        print(f"[parse] {len(meetings)} meetings parsed", flush=True)
+        # Phase 3: 既処理 call_id をスプシ L列（議事録URL=amptalk URL）から引いて重複排除
+        seen = {extract_call_id(u) for u in sheets.existing_minutes_urls()}
+        seen.discard("")
+        targets = [c for c in external if str(c.get("id", "")).lower() not in seen]
+        print(f"[dedup] new={len(targets)} (skipped {len(external) - len(targets)})", flush=True)
 
-        if not meetings:
-            _post_heartbeat(slack, after_ts, before_ts)
-            print("[end] 議事録0件、終了", flush=True)
+        if not targets:
+            _post_heartbeat(slack, after_dt, before_dt)
+            print("[end] 新規社外コール0件、終了", flush=True)
             return
 
-        # Phase 4: 社外/社内振り分け & 項目展開
+        # Phase 4: analysis 取得 → 議事録構築（要約minuteをパース）→ 項目展開
+        meetings: list[MinutesMeeting] = []
+        for c in targets:
+            mtg = build_meeting_from_call(c)
+            if mtg:
+                meetings.append(mtg)
+        print(f"[parse] {len(meetings)} meetings built", flush=True)
+
+        if not meetings:
+            _post_heartbeat(slack, after_dt, before_dt)
+            print("[end] 解析未完了/空、終了", flush=True)
+            return
+
         items: list[DetectedItem] = []
         meeting_lookup: dict[str, MinutesMeeting] = {}
         meeting_context_map: dict[str, str] = {}
 
         for mtg in meetings:
             mtype = classify_meeting_type(mtg.call_name, mtg.meeting_title, mtg.tasks_customer, mtg.memo)
-            # 社内MTGは完全スキップ（通知もスプシも対象外）
-            # 提案機会検知くんは社外MTGからのアップセル機会検知が主目的
+            # 社内MTGは完全スキップ（社外フィルタ済みだが二重で守る）
             if mtype == "社内":
                 print(f"[skip] 社内MTG: {mtg.call_name}", flush=True)
                 continue
-            project = extract_project_name(mtg.channel_name, mtg.call_name)
+            project = mtg.customer.strip() or extract_project_name(mtg.channel_name, mtg.call_name)
             clean_title = strip_prefix_from_call_name(mtg.call_name)
-            meeting_key = f"{mtg.channel_id}_{int(mtg.posted_at.timestamp())}"
+            meeting_key = mtg.call_id
             meeting_lookup[meeting_key] = mtg
-
-            # AI判定用の議事録コンテキスト（会議タイトル＋▼決定事項冒頭で文脈ヒント）
             meeting_context_map[meeting_key] = _build_meeting_context(mtg)
 
+            # 顧客タスク（<顧客>）は検知対象から除外（6/18決定）。task_customer は展開しない。
             for section_name, lines in [
                 ("decision", mtg.decisions),
-                ("task_customer", mtg.tasks_customer),
                 ("task_nyle", mtg.tasks_nyle),
                 ("bant", mtg.bant),
                 ("memo", mtg.memo),
@@ -186,30 +214,49 @@ def run_teian_kenchi() -> None:
                         original_text=line,
                         meeting_key=meeting_key,
                     ))
-        print(f"[expand] {len(items)} items expanded", flush=True)
+        print(f"[expand] {len(items)} items expanded（顧客タスク除外済み）", flush=True)
 
         # Phase 5: AI判定（絵文字・サマリ生成・ノイズ除外）
         items = evaluate_with_claude(claude, items, skill_content, meeting_context_map)
         print(f"[evaluate] {len(items)} items after AI filter", flush=True)
 
-        if not items:
-            _post_heartbeat(slack, after_ts, before_ts)
-            print("[notify] 検知0件のため通知スキップ（ハートビートのみ投稿）", flush=True)
-            return
-
-        # Phase 6: 議事録ごとにグループ化 → 通知＆スプシ追記
+        # Phase 6: 議事録ごとにグループ化 → emoji0完全スルー → 通知＆スプシ追記
         grouped: dict[str, list[DetectedItem]] = {}
         for it in items:
             grouped.setdefault(it.meeting_key, []).append(it)
 
+        dry_run = _is_dry_run()
+        if dry_run:
+            print("[dry-run] Slack投稿・スプシ書き込みは行わない（ログのみ）", flush=True)
+
         rows_to_append: list[dict] = []
+        posted_meetings = 0
         for meeting_key, group_items in grouped.items():
             mtg = meeting_lookup.get(meeting_key)
             if not mtg:
                 continue
 
-            # 親メッセージ投稿（セクション内を絵文字優先順位順に並べ替え済み）
+            # 検知くん②: 🆕/🚨/🏃 が1つも無い議事録は親投稿もスプシも完全スルー
+            # （emoji0 ＝ アップセル/リスク/早急の機会なし）
+            if not any(i.emoji in EMOJI_PRIORITY for i in group_items):
+                print(f"[skip-emoji0] meeting={meeting_key} 絵文字付き0件のため完全スルー", flush=True)
+                continue
+
             parent_text = build_parent_message(mtg, group_items)
+            thread_items = [i for i in group_items if i.emoji == ""]
+
+            # dry-run：投稿せずログ出力、行は組み立てるが追記しない
+            if dry_run:
+                print(f"[dry-run][parent] meeting={meeting_key}\n{parent_text}\n", flush=True)
+                if thread_items:
+                    print(f"[dry-run][thread]\n{build_thread_message(thread_items)}\n", flush=True)
+                for it in group_items:
+                    it.notification_url = "(dry-run)"
+                    rows_to_append.append(build_sheet_row(it))
+                posted_meetings += 1
+                continue
+
+            # 親メッセージ投稿（セクション内を絵文字優先順位順に並べ替え済み）
             parent_resp = slack.post_message(NOTIFICATION_CHANNEL, parent_text)
             parent_ts = parent_resp.get("ts", "") if parent_resp.get("ok") else ""
             parent_permalink = (
@@ -217,9 +264,7 @@ def run_teian_kenchi() -> None:
                 if parent_ts else ""
             )
 
-            # スレッド子メッセージ投稿
-            # 親メッセージから漏れた項目（装飾なし全部 + memoの装飾なし）を「▼参考情報」として展開
-            thread_items = [i for i in group_items if i.emoji == ""]
+            # スレッド子メッセージ投稿（装飾なし項目＝▼参考情報）
             if thread_items and parent_ts:
                 thread_text = build_thread_message(thread_items)
                 _post_thread(slack, NOTIFICATION_CHANNEL, parent_ts, thread_text)
@@ -228,31 +273,52 @@ def run_teian_kenchi() -> None:
             for it in group_items:
                 it.notification_url = parent_permalink
                 rows_to_append.append(build_sheet_row(it))
-
+            posted_meetings += 1
             print(f"[notify] meeting={meeting_key} items={len(group_items)} posted", flush=True)
 
-        if rows_to_append:
-            appended = sheets.append_rows(rows_to_append)
-            print(f"[sheets] appended {appended} rows", flush=True)
+        if not rows_to_append:
+            _post_heartbeat(slack, after_dt, before_dt)
+            print("[notify] 全議事録がemoji0スルー、ハートビートのみ投稿", flush=True)
+            return
+
+        if dry_run:
+            print(f"[dry-run] would append {len(rows_to_append)} rows（{posted_meetings} meetings）。スプシ書き込みスキップ", flush=True)
+            return
+
+        appended = sheets.append_rows(rows_to_append)
+        print(f"[sheets] appended {appended} rows（{posted_meetings} meetings）", flush=True)
     finally:
         if claude.has_token_rotated():
             _emit_refresh_token_output(claude.get_current_refresh_token())
 
 
 def _build_meeting_context(mtg: MinutesMeeting) -> str:
-    """AI判定時に渡す議事録コンテキスト（会議タイトル＋▼決定事項冒頭1〜2行）"""
+    """AI判定時に渡す議事録コンテキスト。
+
+    v2では amptalk が文字起こしを解析して生成した「提案機会検知minute」を主たる
+    文脈として渡す（v1の薄い1行ではなく、商談全体の機会・ニーズの根拠を判定に効かせる）。
+    """
     lines = []
     if mtg.meeting_title:
         lines.append(f"会議議題: {mtg.meeting_title}")
+    if mtg.proposal.strip():
+        lines.append(f"【amptalk提案機会検知（文字起こし由来）】\n{mtg.proposal.strip()}")
     if mtg.decisions:
-        decisions_excerpt = " / ".join(mtg.decisions[:2])
+        decisions_excerpt = " / ".join(mtg.decisions[:3])
         lines.append(f"▼決定事項冒頭: {decisions_excerpt}")
-    return " | ".join(lines)
+    return "\n".join(lines)
 
 
-def _post_heartbeat(slack: SlackTools, after_ts: int, before_ts: int) -> None:
+def _is_dry_run() -> bool:
+    return os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes")
+
+
+def _post_heartbeat(slack: SlackTools, after_dt: datetime, before_dt: datetime) -> None:
     """検知0件でも稼働確認のため「💤 検知なし」をハートビート投稿する（将来オフ化予定）"""
-    text = f"💤 検知なし\n対象範囲: {fmt_ts(after_ts)} 〜 {fmt_ts(before_ts)}"
+    if _is_dry_run():
+        print("[dry-run] heartbeat 投稿スキップ", flush=True)
+        return
+    text = f"💤 検知なし\n対象範囲: {after_dt:%Y/%m/%d %H:%M} 〜 {before_dt:%Y/%m/%d %H:%M} JST"
     try:
         slack.post_message(NOTIFICATION_CHANNEL, text)
         print("[heartbeat] 検知0件のハートビート投稿", flush=True)
@@ -283,36 +349,83 @@ def _emit_refresh_token_output(token: str) -> None:
     print("[oauth] 🔁 GITHUB_OUTPUT に new_refresh_token を書き出した", flush=True)
 
 
-# ========== Phase 1: 検索範囲 ==========
+# ========== Phase 1: 取得窓 ==========
 
-def determine_search_range(slack: SlackTools) -> tuple[int, int]:
+def determine_call_window() -> tuple[datetime, datetime]:
+    """amptalk /calls の callDatetime 取得窓 (after, before) を返す。
+
+    - CUSTOM_AFTER / CUSTOM_BEFORE（"YYYY-MM-DD HH:MM" JST）があればそれを使う（手動再実行用）
+    - 通常は [now - LOOKBACK_HOURS, now]。窓を毎回再走査し、重複排除（L列call_id）で冪等化。
+      解析未完了のコールも、次回以降この窓に入っている限り拾い直せる。
+    """
     custom_after = (os.environ.get("CUSTOM_AFTER") or "").strip()
     custom_before = (os.environ.get("CUSTOM_BEFORE") or "").strip()
     if custom_after and custom_before:
-        af = int(datetime.strptime(custom_after, "%Y-%m-%d %H:%M").replace(tzinfo=JST).timestamp())
-        bf = int(datetime.strptime(custom_before, "%Y-%m-%d %H:%M").replace(tzinfo=JST).timestamp())
+        af = datetime.strptime(custom_after, "%Y-%m-%d %H:%M").replace(tzinfo=JST)
+        bf = datetime.strptime(custom_before, "%Y-%m-%d %H:%M").replace(tzinfo=JST)
         return af, bf
 
-    now_ts = int(datetime.now(JST).timestamp())
-    messages = slack.read_channel_recent(NOTIFICATION_CHANNEL, limit=50)
-    last_post_ts = None
-    for msg in messages:
-        text = msg.get("text", "")
-        # 通知メッセージ側は「📌」絵文字あり、ただしSlack API レスポンスで
-        # 絵文字が ":pushpin:" 表記になる場合があるため、検索は絵文字抜きで照合する
-        if "下記MTGから提案機会を検知しました" in text:
-            try:
-                last_post_ts = int(float(msg.get("ts", "0")))
-                break
-            except (ValueError, TypeError):
-                continue
+    now = datetime.now(JST)
+    return now - timedelta(hours=LOOKBACK_HOURS), now
 
-    if last_post_ts:
-        return last_post_ts, now_ts
 
-    # フォールバック: 直近24時間（前回通知時刻が拾えなかった場合の取りこぼし防止）
-    start = datetime.now(JST) - timedelta(hours=24)
-    return int(start.timestamp()), now_ts
+# ========== Phase 4: コール → 議事録構築 ==========
+
+def build_meeting_from_call(call: dict) -> MinutesMeeting | None:
+    """amptalk コール1件から analysis を取得し、要約minuteをパースして
+    MinutesMeeting を構築する。解析未完了・要約空・パース全空は None。
+    """
+    call_id = str(call.get("id", "")).lower()
+    if not call_id:
+        return None
+
+    analysis = fetch_analysis(call_id)
+    if not analysis or not analysis.get("is_finished"):
+        print(f"[parse] 解析未完了/取得不可: {call_id[:8]}…", flush=True)
+        return None
+
+    summary = analysis.get("summary", "")
+    if not summary.strip():
+        print(f"[parse] 要約minute空: {call_id[:8]}…", flush=True)
+        return None
+
+    # 要約minute は Slack議事録Bot投稿と同形式（<会議議題>…▼決定事項…▼タスク…）
+    body = extract_target_range_flex(summary)
+    if not body.strip():
+        return None
+
+    meeting_title = extract_meeting_title(body)
+    decisions = extract_section_lines(body, "▼決定事項")
+    tasks_block = extract_section_block(body, "▼タスク")
+    tasks_customer = extract_subsection_lines(tasks_block, "<顧客>")
+    tasks_nyle = extract_subsection_lines(tasks_block, "<ナイル>")
+    bant = extract_section_lines(body, "▼BANT")
+    memo = extract_section_lines(body, "▼メモ")
+
+    if not any([decisions, tasks_customer, tasks_nyle, bant, memo]):
+        return None
+
+    try:
+        posted_at = datetime.fromisoformat(call.get("callDatetime", "")).astimezone(JST)
+    except (ValueError, TypeError):
+        posted_at = datetime.now(JST)
+
+    return MinutesMeeting(
+        posted_at=posted_at,
+        channel_id="",
+        channel_name="",
+        permalink=call_detail_url(call_id),
+        call_name=str(call.get("title", "")),
+        meeting_title=meeting_title,
+        decisions=decisions,
+        tasks_customer=tasks_customer,
+        tasks_nyle=tasks_nyle,
+        bant=bant,
+        memo=memo,
+        call_id=call_id,
+        proposal=analysis.get("proposal", ""),
+        customer=str(call.get("customer", "")),
+    )
 
 
 # ========== Phase 2: スキャン ==========
@@ -700,7 +813,7 @@ def build_parent_message(meeting: MinutesMeeting, items: list[DetectedItem]) -> 
     - 元議事録のセクション（▼決定事項/▼タスク/▼BANT等）を横断して、絵文字で再分類
     - 装飾なし項目と ▼メモ採用分は親には載せず、スレッド子に回す
     """
-    project_name = extract_project_name(meeting.channel_name, meeting.call_name)
+    project_name = meeting.customer.strip() or extract_project_name(meeting.channel_name, meeting.call_name)
     clean_title = strip_prefix_from_call_name(meeting.call_name)
 
     lines = [
