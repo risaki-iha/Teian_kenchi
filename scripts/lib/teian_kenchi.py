@@ -7,9 +7,10 @@
   （旧版は箇条書き1行=1項目で独立判定し過分割していた＝案Aで根治）
 - 絵文字は3マーク: 💰 アップセル機会 / 🚨 競争・離反リスク / ● 普通のタスク
   （早急さは🏃マークにせず【期日】行で表現）
-- **1議事録 = 1親メッセージ**（💰/🚨/● を絵文字軸3セクションに整形）
+- **1議事録 = 1親メッセージ**（v2.2＝💰/🚨/● を領域カテゴリでグルーピングして整形）
 - **1検知項目 = 1スプシ行**
 - 💰 か 🚨 が1件でもある議事録だけ通知（● だけの議事録は完全スルー）
+- ● タスクは期日付きのみ採用（期日なし● は通知もスプシも完全除外）
 - メンションなし通知（マネ＋AMメンションは別フェーズ）
 """
 
@@ -74,12 +75,11 @@ SECTION_LABEL_FOR_SHEET = {
     "memo": "メモ",
 }
 
-# 親メッセージは「絵文字軸」3セクション構成（マネ＋AM視点で攻める/守る/やる）
-EMOJI_PARENT_SECTIONS = [
-    (EMOJI_UPSELL, "▼アップセル機会"),
-    (EMOJI_RISK, "▼リスク警告"),
-    (EMOJI_TASK, "▼タスク（TODO）"),
-]
+# 領域カテゴリ（v2.2・固定7枠・この順で親メッセージに表示。出番ゼロの枠は非表示）
+# AI が各項目に付与し、親メッセージは「領域 → 💰/🚨/● 優先度順」でグルーピングする
+CATEGORY_ORDER = ["広告", "SEO", "サイト改善", "コンテンツ", "SNS運用", "計測・データ基盤", "その他"]
+VALID_CATEGORIES = set(CATEGORY_ORDER)
+CATEGORY_FALLBACK = "その他"
 
 # amptalk議事録の冒頭にある :link: amptalk: <URL> 行を除去する正規表現
 AMPTALK_LINK_PATTERN = re.compile(r"^:link:\s*amptalk:\s*<[^>]+>\s*\n?", re.MULTILINE)
@@ -122,6 +122,7 @@ class DetectedItem:
     minutes_url: str             # 議事録Bot投稿permalink
     source_section: str          # 'decision' | 'task_customer' | 'task_nyle' | 'bant' | 'memo'
     original_text: str
+    category: str = ""           # 領域（広告/SEO/サイト改善/コンテンツ/SNS運用/計測・データ基盤/その他）
     notification_url: str = ""   # 親メッセージ投稿後に埋める
     meeting_key: str = ""        # 議事録単位の集約キー
 
@@ -650,7 +651,11 @@ def generate_distinct_items(
         summary = (r.get("summary", "") or "").strip()
         if not summary:
             continue
+        emoji = _normalize_emoji(r.get("emoji", ""))
         due_in = (r.get("due", "") or "").strip()
+        # v2.2: ● タスクは期日付きのみ採用。期日なし● は通知もスプシも完全除外
+        if emoji == EMOJI_TASK and not due_in:
+            continue
         due_date, _ = extract_due_date(due_in) if due_in else ("", "")
         items.append(DetectedItem(
             meeting_posted_at=mtg.posted_at,
@@ -659,13 +664,14 @@ def generate_distinct_items(
             channel_id=mtg.channel_id,
             project_name=project,
             meeting_title=clean_title,
-            emoji=_normalize_emoji(r.get("emoji", "")),
+            emoji=emoji,
             label=(r.get("label", "") or "").strip(),
             summary=summary,
             due_date=due_date,
             due_raw=due_in,
             minutes_url=mtg.permalink,
             source_section=_normalize_section(r.get("source_section", "")),
+            category=_normalize_category(r.get("category", "")),
             original_text="",
             meeting_key=mtg.call_id,
         ))
@@ -714,6 +720,12 @@ def _normalize_section(section: str) -> str:
     return s if s in VALID_SECTIONS else "decision"
 
 
+def _normalize_category(category: str) -> str:
+    """AI の領域出力を CATEGORY_ORDER の7枠に正規化。枠外・空は『その他』。"""
+    c = (category or "").strip()
+    return c if c in VALID_CATEGORIES else CATEGORY_FALLBACK
+
+
 def _request_distinct(claude: ClaudeClient, blob: str, skill_content: str) -> list[dict]:
     """議事録1件の全内容(blob)を AI に渡し、重複を排した distinct な検知項目の
     JSON配列を得る。1議事録 = 1 API コール（過分割の根治）。
@@ -731,7 +743,8 @@ def _request_distinct(claude: ClaudeClient, blob: str, skill_content: str) -> li
             {
                 "emoji": "string - 💰(アップセル機会) / 🚨(競争・離反リスク) / ●(普通のタスク・情報) のいずれか1つ",
                 "label": "string - 8〜12字の体言止めテーマ見出し（【】記号なし）",
-                "summary": "string - 自然な日本語の簡潔なサマリ（〜50字目安）。期日表記は含めない",
+                "summary": "string - 自然な日本語のサマリ。情報量厚めに（80〜120字目安・必要なら2文）。具体の数字・固有名詞・背景・狙い（なぜ機会/リスクか）を盛り込む。期日表記は含めない",
+                "category": "string - 領域分類。広告 / SEO / サイト改善 / コンテンツ / SNS運用 / 計測・データ基盤 / その他 のいずれか1つ",
                 "source_section": "string - decision / task_nyle / bant / memo のいずれか（主な出どころ）",
                 "due": "string - 期日があれば原文の期日表記（例 2026/07/03 や 今週中）。なければ空文字",
                 "is_noise": "boolean - 採用しない項目の場合 true（出力配列から除外）",
@@ -745,8 +758,9 @@ def _request_distinct(claude: ClaudeClient, blob: str, skill_content: str) -> li
             "早急さ(至急/今週中等)は絵文字にせず due に期日として入れる(🏃マークは廃止)",
             "▼決定事項・▼タスク<ナイル>・▼BANT は情報があれば原則採用。『未確認』『特になし』だけは is_noise=true",
             "▼メモは『マネ＋AMが判断に使える情報』のみ採用。雑談・進捗・社内共有のみは is_noise=true",
+            "category は7枠から必ず1つ付与: 広告(リスティング/SNS広告/運用型広告) / SEO(検索順位・オーガニック流入・内部対策・コンテンツSEO) / サイト改善(CRO・UI/UX・フォーム・LP・回遊改善) / コンテンツ(記事制作・リライト・編集・オウンドメディア) / SNS運用(Instagram/X等の運用・投稿・アカウント) / 計測・データ基盤(GA4・GTM・タグ・ダッシュボード・データ連携) / その他(上記に当てはまらない・複数横断)。施策/成果の内容で判断し、迷う場合は その他",
             "label は全項目に付与。8〜12字の体言止めで『何の機会/リスク/タスクか』を端的に。【】記号は付けない",
-            "summary は自然な日本語で簡潔に（〜50字目安）。抽象動詞(対応・検討・確認)を避け具体的な目的語を含める。無理な短縮・略語は禁止。期日表記は含めない（別途【期日】行で表示）",
+            "summary は『読んだだけで状況が分かる』情報量で書く（80〜120字目安・必要なら2文）。①何が起きたか（状況・経緯）②なぜ機会/リスク/タスクなのか（理由・背景）③だから何が必要か、が伝わること。例『コンペ再提案』だけでなく『代理店見直しでRFPが発行され、SEO/コンテンツを複数社コンペに。現契約のナイルも再提案を求められ、勝てないと失注リスク』のように背景と理由まで書く。抽象動詞(対応・検討・確認)を避け具体の数字・固有名詞を含める。無理な短縮・略語は禁止。期日表記は含めない（別途【期日】行で表示）",
             "結果は JSON 配列のみ。コードブロック・前置きなし",
         ],
         "minutes": blob,
@@ -779,16 +793,38 @@ def _request_distinct(claude: ClaudeClient, blob: str, skill_content: str) -> li
 
 # ========== Phase 6: 通知整形 ==========
 
-def _format_item_line(it: DetectedItem) -> str:
-    """親メッセージの1項目行：`絵文字【ラベル】サマリ`（絵文字とラベルの間にスペースなし）"""
-    label = f"【{it.label}】" if it.label else ""
-    return f"{it.emoji}{label}{it.summary}"
+# カテゴリ内の並び順（💰 機会 → 🚨 リスク → ● タスク）
+_EMOJI_RANK = {EMOJI_UPSELL: 0, EMOJI_RISK: 1, EMOJI_TASK: 2}
+
+
+def _format_item_block(it: DetectedItem) -> list[str]:
+    """💰 機会・🚨 リスクの項目ブロック（2〜3行）。
+    `絵文字 *ラベル*` ＋改行＋サマリ本文。期日があれば :date: 行を足す。
+    絵文字は太字の外に出す（Slack mrkdwn は太字内の絵文字をショートコード化するため）。
+    """
+    label = (it.label or "").strip()
+    head = f"{it.emoji} *{label}*" if label else it.emoji
+    block = [head]
+    if it.summary:
+        block.append(it.summary)
+    due = _format_due_for_notify(it)
+    if due:
+        block.append(f":date: {due}")
+    return block
+
+
+def _format_task_line(it: DetectedItem) -> str:
+    """● タスク（期日付きのみ採用）の1行：`● ラベル　:date:期日`。"""
+    label = (it.label or "").strip() or it.summary
+    due = _format_due_for_notify(it)
+    return f"{EMOJI_TASK} {label}　:date:{due}"
 
 
 def build_parent_message(meeting: MinutesMeeting, items: list[DetectedItem]) -> str:
-    """親メッセージ：議事録1件分のヘッダ＋絵文字軸3セクション。
-    - 💰 アップセル機会 / 🚨 リスク警告 / ● タスク（TODO）
-    - AI が議事録単位で生成した distinct な項目を絵文字で3セクションに整形
+    """親メッセージ（v2.2・領域カテゴリ・グルーピング）：議事録1件分のヘッダ＋カテゴリ別。
+    - CATEGORY_ORDER の固定順で表示。出番ゼロの枠は非表示
+    - カテゴリ見出しは太字 `*【○○関連】*`
+    - カテゴリ内は 💰→🚨→● 順。💰/🚨 は太字ラベル＋サマリ（＋期日行）、● は1行（期日付きのみ）
     """
     project_name = meeting.customer.strip() or extract_project_name(meeting.channel_name, meeting.call_name)
     clean_title = strip_prefix_from_call_name(meeting.call_name)
@@ -801,25 +837,28 @@ def build_parent_message(meeting: MinutesMeeting, items: list[DetectedItem]) -> 
     # 会議タイトルが案件名と異なる場合のみ2行目に出す（重複表示防止）
     if clean_title and clean_title != project_name:
         lines.append(f"*{clean_title}*")
-    lines.append(f"議事録：{meeting.permalink}")
-    # 議事録URL の下に区切り線
+    lines.append(f"amptalk URL：{meeting.permalink}")
+    # URL の下に区切り線
     lines.append("─" * 20)
 
-    # 絵文字軸で再分類（元のセクション横断、絵文字付き項目だけ親メッセージへ）
-    for emoji, label in EMOJI_PARENT_SECTIONS:
-        section_items = [i for i in items if i.emoji == emoji]
-        if not section_items:
+    # 領域カテゴリで再分類（CATEGORY_ORDER 固定順、出番ゼロの枠は非表示）
+    for category in CATEGORY_ORDER:
+        cat_items = [i for i in items if _normalize_category(i.category) == category]
+        if not cat_items:
             continue
+        # カテゴリ内は 💰→🚨→● 順に安定ソート
+        cat_items.sort(key=lambda i: _EMOJI_RANK.get(i.emoji, 99))
 
         lines.append("")
-        lines.append(f"*{label}*")
-        for it in section_items:
-            lines.append(_format_item_line(it))
-            due = _format_due_for_notify(it)
-            if due:
-                lines.append(f"【期日】{due}")
-            lines.append("")
-        if lines and lines[-1] == "":
+        lines.append(f"*【{category}関連】*")
+        for it in cat_items:
+            if it.emoji == EMOJI_TASK:
+                lines.append(_format_task_line(it))
+            else:
+                lines.extend(_format_item_block(it))
+                lines.append("")  # 機会/リスクブロックの後に空行
+        # カテゴリ末尾の余分な空行を除去
+        while lines and lines[-1] == "":
             lines.pop()
 
     return "\n".join(lines)
@@ -852,11 +891,12 @@ def slack_get_permalink(slack: SlackTools, channel_id: str, ts: str) -> str:
 # ========== スプシ行構築 ==========
 
 def build_sheet_row(item: DetectedItem) -> dict:
-    section_label = SECTION_LABEL_FOR_SHEET.get(item.source_section, item.source_section)
+    # v2.2: F列「分類タグ」は source_section ではなく領域 category（絵文字＋領域）
+    category = _normalize_category(item.category)
     if item.emoji:
-        category_tag = f"{item.emoji} {section_label}"
+        category_tag = f"{item.emoji} {category}"
     else:
-        category_tag = section_label
+        category_tag = category
 
     return {
         "議事録投稿日時": item.meeting_posted_at.strftime("%Y/%m/%d %H:%M"),
