@@ -15,6 +15,10 @@ on:
         description: "検索終了（JST、例: 2026-06-05 13:00）。空なら通常ロジック"
         required: false
         default: ""
+      dry_run:
+        description: "dry-run（true なら Slack投稿・スプシ書き込みをせずログのみ）"
+        required: false
+        default: "false"
 
 jobs:
   detect:
@@ -42,8 +46,11 @@ jobs:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_USER_TOKEN: ${{ secrets.SLACK_USER_TOKEN }}
           GOOGLE_SHEETS_KEY: ${{ secrets.GOOGLE_SHEETS_KEY }}
+          AMPTALK_API_KEY: ${{ secrets.AMPTALK_API_KEY }}
+          AMPTALK_AUTH_KEY: ${{ secrets.AMPTALK_AUTH_KEY }}
           CUSTOM_AFTER: ${{ github.event.inputs.custom_after }}
           CUSTOM_BEFORE: ${{ github.event.inputs.custom_before }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
         run: python scripts/run_teian_kenchi.py
 
       - name: Rotate CLAUDE_REFRESH_TOKEN
