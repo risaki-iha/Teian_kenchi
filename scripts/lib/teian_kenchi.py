@@ -799,8 +799,9 @@ _EMOJI_RANK = {EMOJI_UPSELL: 0, EMOJI_RISK: 1, EMOJI_TASK: 2}
 
 def _format_item_block(it: DetectedItem) -> list[str]:
     """💰 機会・🚨 リスクの項目ブロック（2〜3行）。
-    `絵文字 *ラベル*` ＋改行＋サマリ本文。期日があれば :date: 行を足す。
+    `絵文字 *ラベル*` ＋改行＋サマリ本文。期日があれば【期日】行を足す。
     絵文字は太字の外に出す（Slack mrkdwn は太字内の絵文字をショートコード化するため）。
+    期日マーカーは :date:（赤系で🚨と色が被る）を避け、テキストの【期日】を使う。
     """
     label = (it.label or "").strip()
     head = f"{it.emoji} *{label}*" if label else it.emoji
@@ -809,30 +810,32 @@ def _format_item_block(it: DetectedItem) -> list[str]:
         block.append(it.summary)
     due = _format_due_for_notify(it)
     if due:
-        block.append(f":date: {due}")
+        block.append(f"【期日】{due}")
     return block
 
 
 def _format_task_line(it: DetectedItem) -> str:
-    """● タスク（期日付きのみ採用）の1行：`● ラベル　:date:期日`。"""
+    """● タスク（期日付きのみ採用）の1行：`● ラベル　【期日】期日`。"""
     label = (it.label or "").strip() or it.summary
     due = _format_due_for_notify(it)
-    return f"{EMOJI_TASK} {label}　:date:{due}"
+    return f"{EMOJI_TASK} {label}　【期日】{due}"
 
 
 def build_parent_message(meeting: MinutesMeeting, items: list[DetectedItem]) -> str:
     """親メッセージ（v2.2・領域カテゴリ・グルーピング）：議事録1件分のヘッダ＋カテゴリ別。
     - CATEGORY_ORDER の固定順で表示。出番ゼロの枠は非表示
     - カテゴリ見出しは太字 `*【○○関連】*`
-    - カテゴリ内は 💰→🚨→● 順。💰/🚨 は太字ラベル＋サマリ（＋期日行）、● は1行（期日付きのみ）
+    - カテゴリ内は 💰→🚨→● 順。💰/🚨 は太字ラベル＋サマリ（＋【期日】行）、● は1行（期日付きのみ）
+    - 装飾絵文字（📌💼）は付けない（ご茶つき防止）。期日は【期日】テキスト
+    - 末尾に太線（━）を入れて1議事録を締める＝連投時の境目を明確化
     """
     project_name = meeting.customer.strip() or extract_project_name(meeting.channel_name, meeting.call_name)
     clean_title = strip_prefix_from_call_name(meeting.call_name)
 
     lines = [
-        "📌 下記MTGから提案機会を検知しました！",
+        "下記MTGから提案機会を検知しました！",
         "",
-        f"💼 *{project_name}*",
+        f"*{project_name}*",
     ]
     # 会議タイトルが案件名と異なる場合のみ2行目に出す（重複表示防止）
     if clean_title and clean_title != project_name:
@@ -860,6 +863,10 @@ def build_parent_message(meeting: MinutesMeeting, items: list[DetectedItem]) -> 
         # カテゴリ末尾の余分な空行を除去
         while lines and lines[-1] == "":
             lines.pop()
+
+    # 末尾に太線で1議事録を締める（連投時、次MTGとの境目を明確化）
+    lines.append("")
+    lines.append("━" * 20)
 
     return "\n".join(lines)
 
