@@ -18,7 +18,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 MASTER_SPREADSHEET_ID = "1PWqW08yD6shJu5sRUxTZvf7w7K7TaJEuQcDU2QmkZXY"
-MASTER_SHEET_NAME = "1_顧客一覧"
+MASTER_SHEET_NAME = "（伊波作業中）1_顧客一覧"
 
 # 一覧にいない案件、または一覧にはいるが user_id を解決できなかった案件の
 # 上長メンション フォールバック先（宮澤）。
@@ -27,9 +27,9 @@ DEFAULT_MENTION_EMAIL = "toru_my@nyle.co.jp"
 # データ行は4行目(1-indexed)から。1〜3行目は注釈/見出し。
 DATA_START_ROW_INDEX = 3
 COL_CALL_NAME = 1     # B列
-COL_MANAGER = 3       # D列（slackメンション先 ※マネ）
-COL_EMAIL = 4         # E列（MGメアド）
-COL_SLACK_CH_ID = 6   # G列（slackチャンネルID）
+COL_MANAGER = 7       # H列（slackメンション先 ※マネ）
+COL_EMAIL = 8         # I列（MGメアド）
+COL_SLACK_CH_ID = 10  # K列（slackチャンネルID）
 
 
 class SupervisorResolver:
@@ -59,7 +59,7 @@ class SupervisorResolver:
             ch_id = (row[COL_SLACK_CH_ID] or "").strip()
             if not manager and not email:
                 continue
-            entry = {"name": manager, "email": email}
+            entry = {"name": manager, "email": email, "notify_ch_id": ch_id}
             if ch_id:
                 self._by_channel_id[ch_id] = entry
             if call_name:
@@ -79,6 +79,23 @@ class SupervisorResolver:
                 if call_name in channel_name:
                     return entry
         return None
+
+    def resolve_notify_channel(self, call_name: str, fallback: str) -> str:
+        """コール名 → 通知先SlackチャンネルID。マッチしない場合は fallback を返す。
+
+        マスタB列（コール名検索）の完全一致を優先し、
+        次にマスタのコール名が amptalk タイトルに含まれるか部分マッチで探す。
+        """
+        if not self._loaded:
+            return fallback
+        entry = self._by_call_name.get(call_name)
+        if entry and entry.get("notify_ch_id"):
+            return entry["notify_ch_id"]
+        for stored, e in self._by_call_name.items():
+            if stored and stored in call_name:
+                if e.get("notify_ch_id"):
+                    return e["notify_ch_id"]
+        return fallback
 
     def resolve_mention(
         self,
