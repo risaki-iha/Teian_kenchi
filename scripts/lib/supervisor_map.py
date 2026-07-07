@@ -26,10 +26,29 @@ DEFAULT_MENTION_EMAIL = "toru_my@nyle.co.jp"
 
 # データ行は4行目(1-indexed)から。1〜3行目は注釈/見出し。
 DATA_START_ROW_INDEX = 3
-COL_CALL_NAME = 1     # B列
-COL_MANAGER = 7       # H列（slackメンション先 ※マネ）
-COL_EMAIL = 8         # I列（MGメアド）
-COL_SLACK_CH_ID = 10  # K列（slackチャンネルID）
+COL_CALL_NAME = 1      # B列
+COL_CALL_NAME_SUB = 2  # C列（コール名検索サブ）
+COL_MANAGER = 7        # H列（slackメンション先 ※マネ）
+COL_EMAIL = 8          # I列（MGメアド）
+COL_SLACK_CH_ID = 10   # K列（slackチャンネルID）
+
+# & / ＆ を別の区切り文字に置換したバリエーションで部分マッチを試みる
+_AMP_SEPARATORS = ["／", "/", "（", " ", "・"]
+
+
+def _expand_amp_variants(s: str) -> list[str]:
+    """& / ＆ を含む文字列の区切り文字バリエーションを生成する（表記ゆらぎ吸収）。
+    & を持たない文字列はそのまま [s] を返す。
+    """
+    normalized = s.replace("＆", "&")
+    if "&" not in normalized:
+        return [s]
+    variants: list[str] = [s, normalized]
+    for sep in _AMP_SEPARATORS:
+        v = normalized.replace("&", sep)
+        if v not in variants:
+            variants.append(v)
+    return variants
 
 
 class SupervisorResolver:
@@ -54,6 +73,7 @@ class SupervisorResolver:
             if len(row) <= COL_SLACK_CH_ID:
                 continue
             call_name = (row[COL_CALL_NAME] or "").strip()
+            call_name_sub = (row[COL_CALL_NAME_SUB] or "").strip() if len(row) > COL_CALL_NAME_SUB else ""
             manager = (row[COL_MANAGER] or "").strip()
             email = (row[COL_EMAIL] or "").strip()
             ch_id = (row[COL_SLACK_CH_ID] or "").strip()
@@ -62,9 +82,10 @@ class SupervisorResolver:
             entry = {"name": manager, "email": email, "notify_ch_id": ch_id}
             if ch_id:
                 self._by_channel_id[ch_id] = entry
-            if call_name:
-                # コール名重複時は先勝ち（手前のほうが主案件と仮定）
-                self._by_call_name.setdefault(call_name, entry)
+            # B列・C列のコール名を & 展開バリエーションも含めて登録（先勝ち）
+            for name in filter(None, [call_name, call_name_sub]):
+                for variant in _expand_amp_variants(name):
+                    self._by_call_name.setdefault(variant, entry)
         self._loaded = True
 
     def resolve_entry(self, channel_id: str, channel_name: str) -> dict | None:
