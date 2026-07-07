@@ -25,7 +25,6 @@ from pathlib import Path
 from .claude_oauth import ClaudeClient
 from .slack_tools import SlackTools
 from .teian_sheets_tools import TeianSheetsTools
-from .supervisor_map import SupervisorResolver
 from .amptalk_client import (
     fetch_calls,
     fetch_analysis,
@@ -147,8 +146,6 @@ def run_teian_kenchi() -> None:
     try:
         slack = SlackTools()
         sheets = TeianSheetsTools()
-        resolver = SupervisorResolver()
-        resolver.load()
         skill_path = Path(__file__).parent.parent.parent / "skills" / "teian-kenchi-realtime.md"
         skill_content = skill_path.read_text(encoding="utf-8")
 
@@ -243,14 +240,11 @@ def run_teian_kenchi() -> None:
                 posted_meetings += 1
                 continue
 
-            # 案件チャンネルを解決（マッチしない場合は #dxm_提案機会_検知くん にフォールバック）
-            notify_ch = resolver.resolve_notify_channel(mtg.call_name, NOTIFICATION_CHANNEL)
-
             # 親メッセージ投稿（セクション内を絵文字優先順位順に並べ替え済み）
-            parent_resp = slack.post_message(notify_ch, parent_text)
+            parent_resp = slack.post_message(NOTIFICATION_CHANNEL, parent_text)
             parent_ts = parent_resp.get("ts", "") if parent_resp.get("ok") else ""
             parent_permalink = (
-                slack_get_permalink(slack, notify_ch, parent_ts)
+                slack_get_permalink(slack, NOTIFICATION_CHANNEL, parent_ts)
                 if parent_ts else ""
             )
 
