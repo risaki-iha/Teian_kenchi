@@ -835,13 +835,13 @@ def _money_risk_numbers(items: list[DetectedItem]) -> dict[int, int]:
 
 def _format_item_line(it: DetectedItem, number: int) -> str:
     """💰 機会・🚨 リスクの親メッセージ用1行：`絵文字丸数字 label　【期日】期日`（● と同じく期日は親に出す）。
+    期日が元データに無い場合は「言及なし」を明示（空欄だと抽出漏れなのか本当に無いのか区別できないため）。
     詳細（サマリ本文）はスレッドへ、丸数字で対応付ける（ラベル全文の二重表示を避ける）。
     """
     label = (it.label or "").strip()
     head = f"{it.emoji}{_circled(number)} {label}" if label else f"{it.emoji}{_circled(number)}"
-    due = _format_due_for_notify(it)
-    if due:
-        head += f"　【期日】{due}"
+    due = _format_due_for_notify(it) or "言及なし"
+    head += f"　【期日】{due}"
     return head
 
 
