@@ -106,7 +106,7 @@ class SlackTools:
                 print(f"[read_channel error] {channel}: {e.response['error']}", flush=True)
                 return []
 
-    def post_message(self, channel: str, text: str, username: str = "") -> dict:
+    def post_message(self, channel: str, text: str, username: str = "", thread_ts: str = "") -> dict:
         kwargs = {
             "channel": channel,
             "text": text,
@@ -116,6 +116,8 @@ class SlackTools:
         if username:
             # username 上書きには chat:write.customize スコープが必要
             kwargs["username"] = username
+        if thread_ts:
+            kwargs["thread_ts"] = thread_ts
         try:
             resp = self.client.chat_postMessage(**kwargs)
             return {"ok": True, "ts": resp.get("ts")}

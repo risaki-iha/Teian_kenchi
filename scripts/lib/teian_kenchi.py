@@ -7,7 +7,7 @@
   （旧版は箇条書き1行=1項目で独立判定し過分割していた＝案Aで根治）
 - 絵文字は3マーク: 💰 アップセル機会 / 🚨 競争・離反リスク / ● 普通のタスク
   （早急さは🏃マークにせず【期日】行で表現）
-- **1議事録 = 1親メッセージ**（v2.2＝💰/🚨/● を領域カテゴリでグルーピングして整形）
+- **1議事録 = 1親メッセージ＋1スレッド返信**（v2.3＝親はカテゴリ別1行の一覧、詳細(💰/🚨のサマリ・期日)はスレッドへ分離）
 - **1検知項目 = 1スプシ行**
 - 💰 か 🚨 が1件でもある議事録だけ通知（● だけの議事録は完全スルー）
 - ● タスクは期日付きのみ採用（期日なし● は通知もスプシも完全除外）
@@ -230,10 +230,12 @@ def run_teian_kenchi() -> None:
                 continue
 
             parent_text = build_parent_message(mtg, group_items)
+            thread_text = build_thread_message(group_items)
 
             # dry-run：投稿せずログ出力、行は組み立てるが追記しない
             if dry_run:
                 print(f"[dry-run][parent] meeting={meeting_key}\n{parent_text}\n", flush=True)
+                print(f"[dry-run][thread] meeting={meeting_key}\n{thread_text}\n", flush=True)
                 for it in group_items:
                     it.notification_url = "(dry-run)"
                     rows_to_append.append(build_sheet_row(it))
@@ -247,6 +249,10 @@ def run_teian_kenchi() -> None:
                 slack_get_permalink(slack, NOTIFICATION_CHANNEL, parent_ts)
                 if parent_ts else ""
             )
+
+            # 詳細（💰/🚨のサマリ・期日）はスレッド返信で1レスにまとめて投稿
+            if parent_ts and thread_text.strip():
+                slack.post_message(NOTIFICATION_CHANNEL, thread_text, thread_ts=parent_ts)
 
             # 全項目の notification_url に親メッセージpermalink を入れる
             for it in group_items:
@@ -742,7 +748,7 @@ def _request_distinct(claude: ClaudeClient, blob: str, skill_content: str) -> li
         "output_schema": [
             {
                 "emoji": "string - 💰(『①ナイルの財布が新たに開く』×『②顧客pull=顧客本人が発注/見積もり/金額/契約/いつ始めるに踏み込む』×『③ナイルのスコープ内(SEO/広告/コンテンツ/サイト改善/計測)』の3つが揃う時のみ。次は💰にせず●：課題・不満の『共有』だけ/コンサルの無償助言を膨らませたもの/ナイル社員・制作側・代理店の発言(顧客本人でない)/スコープ外(CMS開発・社内システム改修等)/顧客が社内・別ベンダーに聞く話/AI推測の提案余地/既存予算内の最適化/既存契約内のサービス/継続維持) / 🚨(競争・離反/継続リスク) / ●(普通のタスク・情報) のいずれか1つ",
-                "label": "string - 8〜12字の体言止めテーマ見出し（【】記号なし）",
+                "label": "string - 20〜30字程度の体言止め見出し（【】記号なし）。単体の1行で通知の親メッセージに出るため、テーマ名だけでなく『何を・なぜ』まで一目で伝わる具体性を持たせる（例：「サイト構造・UX設計の追加提案」ではなく「EC×コーポレート連携のサイト構造・UX設計を追加提案」）",
                 "summary": "string - 自然な日本語のサマリ。情報量厚めに（80〜120字目安・必要なら2文）。具体の数字・固有名詞・背景・狙いを盛り込む。ただし書き起こし・要約minuteにある事実だけ（原文に無い結論/余地/追加投資/拡大の創作は禁止）。期日表記は含めない",
                 "category": "string - 領域分類。広告 / SEO / サイト改善 / コンテンツ / SNS運用 / 計測・データ基盤 / その他 のいずれか1つ",
                 "source_section": "string - decision / task_nyle / bant / memo のいずれか（主な出どころ）",
@@ -759,7 +765,7 @@ def _request_distinct(claude: ClaudeClient, blob: str, skill_content: str) -> li
             "▼決定事項・▼タスク<ナイル>・▼BANT は情報があれば原則採用。『未確認』『特になし』だけは is_noise=true",
             "▼メモは『マネ＋AMが判断に使える情報』のみ採用。雑談・進捗・社内共有のみは is_noise=true",
             "category は7枠から必ず1つ付与: 広告(リスティング/SNS広告/運用型広告) / SEO(検索順位・オーガニック流入・内部対策・コンテンツSEO) / サイト改善(CRO・UI/UX・フォーム・LP・回遊改善) / コンテンツ(記事制作・リライト・編集・オウンドメディア) / SNS運用(Instagram/X等の運用・投稿・アカウント) / 計測・データ基盤(GA4・GTM・タグ・ダッシュボード・データ連携) / その他(上記に当てはまらない・複数横断)。施策/成果の内容で判断し、迷う場合は その他",
-            "label は全項目に付与。8〜12字の体言止めで『何の機会/リスク/タスクか』を端的に。【】記号は付けない",
+            "label は全項目に付与。20〜30字程度の体言止めで、『何の機会/リスク/タスクか』だけでなく主語・対象・狙いまで一目で分かる具体性を持たせる（💰/🚨は親メッセージにこの1行だけが単独表示されるため、label単体で内容が伝わる必要がある）。【】記号は付けない",
             "summary は『読んだだけで状況が分かる』情報量で書く（80〜120字目安・必要なら2文）。①何が起きたか（状況・経緯）②なぜ機会/リスク/タスクなのか（理由・背景）③だから何が必要か、が伝わること。★grounding厳守＝書き起こし・要約minuteに実際に話されている事実だけを書き、原文に無い結論/予測/『余地』/金額/『追加投資』『拡大』等を創作しない（例：『予算確保済み』を『追加投資・拡大の余地』と読み替えるのは禁止。確保済み＝既存の金）。②③の理由・含意も元データに根拠がある範囲だけ。例『コンペ再提案』だけでなく『代理店見直しでRFPが発行され…勝てないと失注リスク』のように背景まで書く（ただし元データにある範囲で）。抽象動詞(対応・検討・確認)を避け具体の数字・固有名詞を含める。無理な短縮・略語は禁止。期日表記は含めない（別途【期日】行で表示）",
             "結果は JSON 配列のみ。コードブロック・前置きなし",
         ],
@@ -796,22 +802,46 @@ def _request_distinct(claude: ClaudeClient, blob: str, skill_content: str) -> li
 # カテゴリ内の並び順（💰 機会 → 🚨 リスク → ● タスク）
 _EMOJI_RANK = {EMOJI_UPSELL: 0, EMOJI_RISK: 1, EMOJI_TASK: 2}
 
+# 💰/🚨 の親⇔スレッド対応付け用の丸数字（ラベル全文の二重表示を避けるため）
+_CIRCLED_NUMBERS = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
 
-def _format_item_block(it: DetectedItem) -> list[str]:
-    """💰 機会・🚨 リスクの項目ブロック（2〜3行）。
-    `絵文字 *ラベル*` ＋改行＋サマリ本文。期日があれば【期日】行を足す。
-    絵文字は太字の外に出す（Slack mrkdwn は太字内の絵文字をショートコード化するため）。
-    期日マーカーは :date:（赤系で🚨と色が被る）を避け、テキストの【期日】を使う。
+
+def _circled(n: int) -> str:
+    if 1 <= n <= len(_CIRCLED_NUMBERS):
+        return _CIRCLED_NUMBERS[n - 1]
+    return f"({n})"
+
+
+def _money_risk_display_order(items: list[DetectedItem]) -> list[DetectedItem]:
+    """💰/🚨 項目を、親メッセージに表示される順（カテゴリ固定順→カテゴリ内優先度順）に並べる。
+    親とスレッドの丸数字を一致させるため、両方がこの順序を参照する。
+    """
+    ordered: list[DetectedItem] = []
+    for category in CATEGORY_ORDER:
+        cat_items = [
+            i for i in items
+            if _normalize_category(i.category) == category and i.emoji in (EMOJI_UPSELL, EMOJI_RISK)
+        ]
+        cat_items.sort(key=lambda i: _EMOJI_RANK.get(i.emoji, 99))
+        ordered.extend(cat_items)
+    return ordered
+
+
+def _money_risk_numbers(items: list[DetectedItem]) -> dict[int, int]:
+    """💰/🚨 項目（id(item)をキー）→ 丸数字の連番。親・スレッド共通の対応表。"""
+    return {id(it): idx + 1 for idx, it in enumerate(_money_risk_display_order(items))}
+
+
+def _format_item_line(it: DetectedItem, number: int) -> str:
+    """💰 機会・🚨 リスクの親メッセージ用1行：`絵文字丸数字 label　【期日】期日`（● と同じく期日は親に出す）。
+    詳細（サマリ本文）はスレッドへ、丸数字で対応付ける（ラベル全文の二重表示を避ける）。
     """
     label = (it.label or "").strip()
-    head = f"{it.emoji} *{label}*" if label else it.emoji
-    block = [head]
-    if it.summary:
-        block.append(it.summary)
+    head = f"{it.emoji}{_circled(number)} {label}" if label else f"{it.emoji}{_circled(number)}"
     due = _format_due_for_notify(it)
     if due:
-        block.append(f"【期日】{due}")
-    return block
+        head += f"　【期日】{due}"
+    return head
 
 
 def _format_task_line(it: DetectedItem) -> str:
@@ -822,12 +852,14 @@ def _format_task_line(it: DetectedItem) -> str:
 
 
 def build_parent_message(meeting: MinutesMeeting, items: list[DetectedItem]) -> str:
-    """親メッセージ（v2.2・領域カテゴリ・グルーピング）：議事録1件分のヘッダ＋カテゴリ別。
+    """親メッセージ（v2.3・一覧性優先）：議事録1件分のヘッダ＋カテゴリ別の1行サマリ。
     - CATEGORY_ORDER の固定順で表示。出番ゼロの枠は非表示
     - カテゴリ見出しは太字 `*【○○関連】*`
-    - カテゴリ内は 💰→🚨→● 順。💰/🚨 は太字ラベル＋サマリ（＋【期日】行）、● は1行（期日付きのみ）
+    - カテゴリ内は 💰→🚨→● 順。💰/🚨 は `絵文字 label` の1行（サマリ・期日はスレッドへ）、
+      ● は従来通り1行（期日付きのみ・期日は親に表示のまま）
     - 装飾絵文字（📌💼）は付けない（ご茶つき防止）。期日は【期日】テキスト
     - 末尾に太線（━）を入れて1議事録を締める＝連投時の境目を明確化
+    - 詳細（サマリ・💰/🚨の期日）はスレッド返信（build_thread_message）に分離
     """
     project_name = meeting.customer.strip() or extract_project_name(meeting.channel_name, meeting.call_name)
     clean_title = strip_prefix_from_call_name(meeting.call_name)
@@ -844,6 +876,8 @@ def build_parent_message(meeting: MinutesMeeting, items: list[DetectedItem]) -> 
     # URL の下に区切り線
     lines.append("─" * 20)
 
+    numbers = _money_risk_numbers(items)
+
     # 領域カテゴリで再分類（CATEGORY_ORDER 固定順、出番ゼロの枠は非表示）
     for category in CATEGORY_ORDER:
         cat_items = [i for i in items if _normalize_category(i.category) == category]
@@ -858,15 +892,40 @@ def build_parent_message(meeting: MinutesMeeting, items: list[DetectedItem]) -> 
             if it.emoji == EMOJI_TASK:
                 lines.append(_format_task_line(it))
             else:
-                lines.extend(_format_item_block(it))
-                lines.append("")  # 機会/リスクブロックの後に空行
-        # カテゴリ末尾の余分な空行を除去
-        while lines and lines[-1] == "":
-            lines.pop()
+                lines.append(_format_item_line(it, numbers[id(it)]))
 
     # 末尾に太線で1議事録を締める（連投時、次MTGとの境目を明確化）
     lines.append("")
     lines.append("━" * 20)
+
+    return "\n".join(lines)
+
+
+def build_thread_message(items: list[DetectedItem]) -> str:
+    """スレッド返信（v2.3新設）：💰/🚨 のサマリ本文を領域カテゴリ別にまとめて1レスに。
+    親メッセージの1行（絵文字＋丸数字＋label＋期日）とは丸数字で対応付け、
+    ラベル全文の二重表示は避ける（期日も親に出ているためここでは出さない）。
+    ● は親メッセージで完結済み（期日付き1行）のためスレッドには出さない。
+    親メッセージに1件でも💰/🚨があれば呼ばれるため、本文が空になることはない。
+    """
+    numbers = _money_risk_numbers(items)
+    lines: list[str] = []
+    for category in CATEGORY_ORDER:
+        cat_items = [
+            i for i in items
+            if _normalize_category(i.category) == category and i.emoji in (EMOJI_UPSELL, EMOJI_RISK)
+        ]
+        if not cat_items:
+            continue
+        cat_items.sort(key=lambda i: _EMOJI_RANK.get(i.emoji, 99))
+
+        if lines:
+            lines.append("")
+        lines.append(f"*【{category}関連】*")
+        for it in cat_items:
+            num = _circled(numbers[id(it)])
+            summary = (it.summary or "").strip()
+            lines.append(f"{it.emoji}{num} {summary}")
 
     return "\n".join(lines)
 
