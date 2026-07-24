@@ -862,7 +862,12 @@ def build_parent_message(meeting: MinutesMeeting, items: list[DetectedItem]) -> 
     - 末尾に太線（━）を入れて1議事録を締める＝連投時の境目を明確化
     - 詳細（サマリ・💰/🚨の期日）はスレッド返信（build_thread_message）に分離
     """
-    project_name = meeting.customer.strip() or extract_project_name(meeting.channel_name, meeting.call_name)
+    project_name = (
+        meeting.customer.strip()
+        or extract_project_name(meeting.channel_name, meeting.call_name)
+        or meeting.meeting_title.strip()
+        or "(案件名不明)"
+    )
     clean_title = strip_prefix_from_call_name(meeting.call_name)
 
     lines = [
