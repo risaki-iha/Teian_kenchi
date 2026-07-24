@@ -866,7 +866,7 @@ def build_parent_message(meeting: MinutesMeeting, items: list[DetectedItem]) -> 
     clean_title = strip_prefix_from_call_name(meeting.call_name)
 
     lines = [
-        "下記MTGから提案機会を検知しました！",
+        "下記MTGの提案機会・対応事項をまとめました！",
         "",
         f"*{project_name}*",
     ]
