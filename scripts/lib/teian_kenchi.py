@@ -46,6 +46,9 @@ MINUTES_BOT_USER_ID = "U0B305165M1"
 # 通知先チャンネル
 NOTIFICATION_CHANNEL = "C0AHUC1VDDK"  # #dxm_提案機会_検知くん
 
+# Slack投稿時の表示名（chat:write.customize、クレーム検知くん等と見分けるため）
+NOTIFICATION_USERNAME = "提案機会検知くん"
+
 # 議事録パース用マーカー（柔軟化）
 # 「要約:」があれば その以降を、なければ投稿全体を対象
 EXTRACT_START_MARKERS = ["要約:", "要約：", "<会議議題>", "<議題>"]
@@ -243,7 +246,7 @@ def run_teian_kenchi() -> None:
                 continue
 
             # 親メッセージ投稿（セクション内を絵文字優先順位順に並べ替え済み）
-            parent_resp = slack.post_message(NOTIFICATION_CHANNEL, parent_text)
+            parent_resp = slack.post_message(NOTIFICATION_CHANNEL, parent_text, username=NOTIFICATION_USERNAME)
             parent_ts = parent_resp.get("ts", "") if parent_resp.get("ok") else ""
             parent_permalink = (
                 slack_get_permalink(slack, NOTIFICATION_CHANNEL, parent_ts)
@@ -252,7 +255,7 @@ def run_teian_kenchi() -> None:
 
             # 詳細（💰/🚨のサマリ・期日）はスレッド返信で1レスにまとめて投稿
             if parent_ts and thread_text.strip():
-                slack.post_message(NOTIFICATION_CHANNEL, thread_text, thread_ts=parent_ts)
+                slack.post_message(NOTIFICATION_CHANNEL, thread_text, username=NOTIFICATION_USERNAME, thread_ts=parent_ts)
 
             # 全項目の notification_url に親メッセージpermalink を入れる
             for it in group_items:
@@ -288,7 +291,7 @@ def _post_heartbeat(slack: SlackTools, after_dt: datetime, before_dt: datetime) 
         return
     text = f"💤 検知なし\n対象範囲: {after_dt:%Y/%m/%d %H:%M} 〜 {before_dt:%Y/%m/%d %H:%M} JST"
     try:
-        slack.post_message(NOTIFICATION_CHANNEL, text)
+        slack.post_message(NOTIFICATION_CHANNEL, text, username=NOTIFICATION_USERNAME)
         print("[heartbeat] 検知0件のハートビート投稿", flush=True)
     except Exception as e:
         print(f"[heartbeat error] {e}", flush=True)
